@@ -1,15 +1,60 @@
-# PALETTE — DSP sourcing map (Stage 2 /dsp-fetch result)
+# PALETTE — DSP sourcing map
 
-Per-effect source for all 24 palette effects. **Sibling-first** (the simplexity rule):
-Vincent's own Move plugins are extracted/re-voiced inline (not vendored wholesale — the 20
-Chroma-inspired effects are "re-voiced as original DSP, not clones"). The 4 new originals +
-the lush reverb come from two **MIT Mutable Instruments engines already adapted to the Move
-ARM64 toolchain** in sibling repos (Deforme→Warps, Verglas→Clouds) and vendored here.
+All sources are **MIT** (Mutable Instruments: © 2014 Émilie Gillet; Airwindows: © Chris
+Johnson; Signalsmith: © Geraint Luff; Filliformes siblings: © Filliformes). PALETTE ships MIT.
 
-All sources are **MIT** (Mutable: © 2014 Émilie Gillet; Airwindows: © Chris Johnson;
-Filliformes siblings: © Filliformes). PALETTE ships MIT.
+## ⚖️ AS-BUILT status (the honest record of what each effect ACTUALLY uses)
+
+13 of 24 effects use genuinely fetched/ported open-source DSP; the other 11 are **original C**
+written by Claude (informed by standard topologies, not ported from a verified source). This
+table is authoritative — the per-effect "plan" further down is historical.
+
+| Effect | Implementation | Source |
+|--------|----------------|--------|
+| DRIVE | ported | super-boom-move `sb_apply_dist` Tube (sibling, MIT) |
+| FUZZ | ported | super-boom-move `sb_apply_dist` Fuzz (sibling, MIT) |
+| CASCADE | ported | krautdrums-move `delay_saturate` in feedback (sibling, MIT) |
+| REELS | ported | krautdrums-move `delay_saturate` (sibling, MIT) |
+| CASSETTE | ported | mello-move `tape_cubic`/`tape_asym` (sibling, MIT) |
+| SPACE | ported | Mutable **Clouds** `reverb.h` (MIT) — `fx_clouds.cc` |
+| BLOOM | ported+orig | Clouds `reverb.h` + original shimmer regeneration — `fx_clouds.cc` |
+| FREEZE | ported | **Signalsmith** `WindowedFFT` spectral OLA (MIT) — `fx_spectral.cc` |
+| FILTER | ported | Airwindows **Capacitor** pole recurrence (MIT) |
+| SQUASH | ported | Airwindows **Pressure4** vari-mu comp (MIT) |
+| INTERFERENCE | ported | Airwindows **DeRez2** rate/µ-law/bit crush (MIT) + orig ring-mod |
+| FOLD | ported | real Warps `lut_bipolar_fold` curve (MIT) — `warps_data.c` |
+| SHIFT | ported | real Warps `QuadratureTransform` 17-pole Hilbert (MIT) — `warps_data.c` |
+| SWEETEN | **original C** | console-preamp topology, not ported |
+| HOWL | **original C** | SVF resonant filter-fuzz, not ported |
+| SWELL | **original C** | envelope auto-swell, not ported |
+| DOUBLER | **original C** | ADT modulated delay, not ported |
+| VIBRATO | **original C** | modulated delay, not ported |
+| PHASER | **original C** | N-stage allpass cascade, not ported |
+| TREMOLO | **original C** | LFO×gain, not ported |
+| PITCH | **original C** | dual-tap delay pitch shift, not ported |
+| COLLAGE | **original C** | granular looping delay, not ported |
+| REVERSE | **original C** | windowed reverse delay, not ported |
+| BROKEN | **original C** | motor-failure pitch drop, not ported |
+
+> v2 candidates for further re-sourcing: Airwindows for Sweeten (ToTape/Density), Howl,
+> Tremolo (Tremolo), Pitch; Signalsmith `delay.h` for Doubler/Vibrato/Reverse.
 
 ---
+
+## Vendored OSS
+
+- `vendor/airwindows/` — Pressure4, Capacitor, Drive, Density, DeRez2, Galactic (MIT, Chris
+  Johnson). Per-sample DSP ported into effects; VST/dither dropped.
+- `vendor/signalsmith/` — Signalsmith-Audio/dsp headers (MIT, Geraint Luff): `spectral.h` +
+  `fft.h` drive FREEZE.
+- `vendor/warps_engine/`, `vendor/clouds_engine/` — full Mutable ports (from deforme/verglas).
+  Clouds `reverb.h` is compiled (SPACE/BLOOM); Warps is NOT compiled — its `lut_bipolar_fold`
+  + `lut_ap_poles` are extracted verbatim into `src/dsp/warps_data.c` (avoids the Warps-vs-
+  Clouds stmlib ODR clash).
+
+---
+
+## Original plan (historical — superseded by the AS-BUILT table above)
 
 ## Vendored engines (pinned, local, compilable)
 

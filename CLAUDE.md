@@ -16,19 +16,24 @@ Processes `audio_inout` (the chain signal at this slot), stereo, 44100 Hz, 128 f
 ## Repo structure
 - `design-spec.md` — the locked design (full effect roster, UI, sourcing, budget)
 - `presets.md` — the 25 factory preset definitions (authored in Stage 4)
-- `src/dsp/palette.c` — **host skeleton** (built, runs as clean passthrough today): slot
-  dispatch in FX-Reorder order, the `palette_effect_t` vtable, the 25-way Skip-walk Select,
-  6 randomizers, Input Volume, equal-power Mix, page-aware knob overlay, chain_params.
-  API typedefs embedded inline (match the canonical ABI). DRIVE/TREMOLO/FILTER are worked
-  examples; the other 21 effects are passthrough stubs to fill.
-- `src/dsp/audio_fx_api_v2.h`, `plugin_api_v1.h` — canonical ABI headers (copied from
-  super-boom-move) for when the build goes multi-TU (palette.c currently self-contained,
-  does NOT include them — keep that until the C++ effects land, then refactor to shared headers).
-- `vendor/` — fetched third-party DSP (Mutable Warps/Clouds, etc.). On the include path.
+- `src/dsp/palette.c` — host + all 21 pure-C effects (slot dispatch in FX-Reorder order,
+  `palette_effect_t` vtable, 25-way Skip-walk Select, 6 randomizers, 25 presets, state
+  round-trip, page-aware knob overlay, equal-power Mix, ui_hierarchy getter). API typedefs
+  inline. All 24 effects implemented (SPACE/BLOOM/FREEZE dispatched to the C++ TUs below).
+- `src/dsp/fx_clouds.cc` — SPACE/BLOOM (Mutable Clouds `reverb.h`), C++, `-Ivendor/clouds_engine`.
+  Routes FREEZE to fx_spectral.cc. Opaque `extern "C"` heavy interface; palette.c holds a void*.
+- `src/dsp/fx_spectral.cc` — FREEZE (Signalsmith `WindowedFFT` spectral OLA), `-Ivendor/signalsmith`.
+- `src/dsp/warps_data.c` — authentic Warps `lut_bipolar_fold` + `lut_ap_poles` (plain C arrays,
+  MIT) for FOLD/SHIFT. No Warps engine compiled (avoids the Warps↔Clouds stmlib ODR clash).
+- `src/dsp/audio_fx_api_v2.h`, `plugin_api_v1.h` — canonical ABI headers (reference; palette.c
+  uses inline typedefs and does NOT include them).
+- `vendor/` — `airwindows/` (MIT, Chris Johnson), `signalsmith/` (MIT, Geraint Luff),
+  `warps_engine/` + `clouds_engine/` (Mutable MIT ports). See `vendor/SOURCES.md`.
 - `src/module.json` — metadata + ui_hierarchy + chain_params (authoritative; CI copies it).
 - `module.json` — root copy, **kept in sync** with src/module.json.
 - `scripts/build.sh` — Windows/MSYS-safe Docker ARM64 build (docker create + docker cp).
-  **Compiles both `.c` (gcc) and `.cc`/`.cpp` (g++), links with g++** for the Mutable code.
+  Compiles `.c` (gcc) + `.cc` (g++, `-Ivendor/clouds_engine -Ivendor/signalsmith`), links g++.
+  **4 TUs:** palette.c, warps_data.c, fx_clouds.cc, fx_spectral.cc.
 - `scripts/install.sh` — flat SCP to `ableton@move.local`.
 - `scripts/Dockerfile` — aarch64 toolchain (gcc + g++ + dos2unix).
 - `.github/workflows/release.yml` — CI: version check, C/C++ build, release, release.json.
@@ -46,16 +51,19 @@ enum options identical.
 ★ = the 4 new originals (not in the Chroma): FOLD (West-Coast wavefolder), SHIFT (Bode
 linear frequency shifter), BLOOM (granular shimmer reverb), FREEZE (spectral magnitude freeze).
 
-## DSP sourcing map (sibling-first — the simplexity rule)
-Reach for Vincent's own Move plugins before external sources. See design-spec §3 for the
-per-effect table. Summary:
-- **Sibling-sourced (~half):** DRIVE/SWEETEN/FUZZ/SQUASH ← `super-boom-move`; HOWL/FILTER ←
-  `mello`/`verglas` SVF; DOUBLER/VIBRATO/CASCADE/REELS/REVERSE ← `krautdrums-move`;
-  CASSETTE ← `mello` apply_tape_stage + krautdrums wow/flutter; COLLAGE/FREEZE ← `verglas-move`
-  grain cloud + spectral freeze.
-- **External (MIT):** FOLD ← Mutable **Warps** `modulator.cc` `ALGORITHM_FOLD`; SHIFT ←
-  Warps `quadrature_transform.h` + `quadrature_oscillator.h` (single-sideband); SPACE/BLOOM ←
-  Mutable **Clouds** reverb (or Airwindows Galactic for the "lush" voicing).
+## DSP sourcing map — AS BUILT
+**`vendor/SOURCES.md` is the authoritative per-effect record.** Summary of what each effect
+actually uses (13/24 on genuinely fetched/ported OSS, 11 original C):
+- **Sibling kernels (verbatim, MIT):** DRIVE/FUZZ ← super-boom `sb_apply_dist`; CASCADE/REELS ←
+  krautdrums `delay_saturate`; CASSETTE ← mello `tape_cubic`/`tape_asym`.
+- **Mutable Clouds (compiled, `fx_clouds.cc`):** SPACE = `reverb.h`; BLOOM = `reverb.h` + shimmer.
+- **Signalsmith FFT (`fx_spectral.cc`):** FREEZE = `WindowedFFT` spectral OLA magnitude-freeze.
+- **Airwindows (ported per-sample, MIT):** SQUASH ← Pressure4; FILTER ← Capacitor; INTERFERENCE ← DeRez2.
+- **Mutable Warps DATA (`warps_data.c`, no engine compiled):** FOLD ← `lut_bipolar_fold`;
+  SHIFT ← `lut_ap_poles` 17-pole QuadratureTransform. (Warps engine NOT compiled — its stmlib
+  would ODR-clash with Clouds; only the LUTs are extracted as plain C.)
+- **Original C (not ported):** SWEETEN, HOWL, SWELL, DOUBLER, VIBRATO, PHASER, TREMOLO, PITCH,
+  COLLAGE, REVERSE, BROKEN. (v2 re-sourcing candidates listed in SOURCES.md.)
 - **From scratch / trivial:** SWELL (env→VCA), TREMOLO (LFO×gain), PHASER (N-stage allpass),
   BROKEN (pitch-drop LFO + dropout + AM/FM), INTERFERENCE (bitcrush + noise + ring-mod).
 - Airwindows refs (MIT) for voicing: Fuzz/Edge, Pressure4, Tilt/Capacitor, Galactic, DeRez.
