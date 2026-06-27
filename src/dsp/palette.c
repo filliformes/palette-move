@@ -140,6 +140,9 @@ typedef struct {
     float  f1,f2,f3,f4,f5,f6;
     int    i1,i2,i3,i4;
     uint32_t seed;            /* per-slot deterministic RNG (drift) */
+    /* tempo sync (set per block by the host): >0 = use instead of Macro mapping */
+    float  sync_time;         /* synced delay time in samples (0 = free) */
+    float  sync_rate;         /* synced LFO rate in Hz (0 = free) */
     /* heavy C++ (Clouds) effect state — lazily alloc'd on select change */
     void  *heavy;
     int    heavy_kind;        /* PFX_* id the heavy ptr currently serves (0 = none) */
@@ -181,6 +184,20 @@ typedef struct {
     int    current_preset;    /* 1..50 */
     int    current_level;     /* page-aware knob overlay (see LEVELS) */
     uint32_t rng;
+    /* ── GLOBAL page ─────────────────────────────────────────────── */
+    float  feedback, fb_sm;   /* global feedback send 0..1 (smoothed) */
+    int    tempo_src;         /* 0 = Move (host clock), 1 = Int */
+    int    tempo_bpm;         /* 10..500 internal BPM */
+    int    time_div;          /* 0 = Free, else index into DIVS[] */
+    float  fbL[MAXFRAMES], fbR[MAXFRAMES];  /* feedback buffer (prev block out) */
+    float  fb_lp_l, fb_lp_r;  /* feedback-path damping LP state */
+    /* Move clock tracking (derive BPM from MIDI clock pulses) */
+    uint32_t sample_pos;          /* running sample counter */
+    uint32_t last_clock_sample;   /* sample index at last quarter-note boundary */
+    int    clock_count;           /* MIDI clock pulses since last quarter (24/qn) */
+    float  clock_interval_sm;     /* smoothed samples per quarter */
+    int    clock_running;         /* transport running (0xFA/0xFB/0xFC) */
+    float  move_bpm;              /* BPM derived from Move clock */
     /* scratch buffers for slot processing (per block) */
     float  L[MAXFRAMES], R[MAXFRAMES];
 } palette_t;
@@ -197,6 +214,15 @@ static void perm_label(int idx, char *buf, int n){
     idx = clampi(idx,0,23);
     snprintf(buf,n,"%d-%d-%d-%d",PERM[idx][0]+1,PERM[idx][1]+1,PERM[idx][2]+1,PERM[idx][3]+1);
 }
+
+/* ── Tempo-sync time divisions. npb = notes-per-beat (1/4 = 1). ──────────────── */
+typedef struct { const char *name; float npb; } div_t;
+static const div_t DIVS[] = {
+    {"Free",0.0f}, {"1/1",0.25f}, {"1/2",0.5f}, {"1/2T",0.75f}, {"1/2D",0.33333f},
+    {"1/4",1.0f}, {"1/4T",1.5f}, {"1/4D",0.66667f}, {"1/8",2.0f}, {"1/8T",3.0f},
+    {"1/8D",1.33333f}, {"1/16",4.0f}, {"1/16T",6.0f}, {"1/16D",2.66667f}, {"1/32",8.0f}
+};
+#define NUM_DIVS 15
 
 /* ═══════════════════════════════════════════════════════════════════════════
  *  EFFECT IMPLEMENTATIONS  (21 pure-C effects; SPACE/BLOOM/FREEZE are in
@@ -413,7 +439,7 @@ static void fx_fold(slot_dsp_t *s, float *l, float *r, int n,
  * drift=random momentary detune. */
 static void fx_doubler(slot_dsp_t *s, float *l, float *r, int n,
                        float amount, float macro, float drift){
-    float baseL=SR*(0.012f+macro*0.045f);            /* 12..57 ms */
+    float baseL=(s->sync_time>0.0f)? s->sync_time : SR*(0.012f+macro*0.045f); /* 12..57ms / synced */
     float baseR=baseL*1.28f;
     for(int i=0;i<n;i++){
         s->lfo+=0.6f/SR; if(s->lfo>=1.0f)s->lfo-=1.0f;
@@ -435,7 +461,7 @@ static void fx_doubler(slot_dsp_t *s, float *l, float *r, int n,
  * drift=sine→random waveshape + FM depth. lfo=main phase, lfo2=FM phase. */
 static void fx_vibrato(slot_dsp_t *s, float *l, float *r, int n,
                        float amount, float macro, float drift){
-    float rate=0.5f+macro*7.5f;                      /* 0.5..8 Hz */
+    float rate=(s->sync_rate>0.0f)? s->sync_rate : 0.5f+macro*7.5f;  /* 0.5..8 Hz / synced */
     float depth=SR*0.0005f*(0.3f+amount*4.0f);       /* mod depth in samples */
     float base=SR*0.006f;
     float fmRate=rate*1.61f;                          /* incommensurate 2nd LFO */
@@ -468,7 +494,7 @@ static void fx_vibrato(slot_dsp_t *s, float *l, float *r, int n,
 static void fx_phaser(slot_dsp_t *s, float *l, float *r, int n,
                       float amount, float macro, float drift){
     int stages=2+(int)(amount*10.0f); if(stages>12)stages=12;  /* 2..12 */
-    float rate=0.05f+macro*macro*4.0f;
+    float rate=(s->sync_rate>0.0f)? s->sync_rate : 0.05f+macro*macro*4.0f;  /* synced */
     float fb=amount*0.6f;
     for(int i=0;i<n;i++){
         s->lfo+=rate/SR; if(s->lfo>=1.0f)s->lfo-=1.0f;
@@ -505,7 +531,7 @@ static void fx_tremolo(slot_dsp_t *s, float *l, float *r, int n,
     for(int i=0;i<n;i++){
         s->sm1=((s->sm1*speedSpeed)+speedChase)/(speedSpeed+1.0f);
         s->sm2=((s->sm2*depthSpeed)+depthChase)/(depthSpeed+1.0f);
-        float speed=0.0001f+(s->sm1/1000.0f);
+        float speed=(s->sync_rate>0.0f)? s->sync_rate*TWO_PI/SR : 0.0001f+(s->sm1/1000.0f);
         float skew=1.0f+powf(s->sm2,9.0f);
         float density=((1.0f-s->sm2)*2.0f)-1.0f;
         float offset=sinf(s->lfo);
@@ -592,7 +618,7 @@ static void delay_core(slot_dsp_t *s, float *l, float *r, int n,
                        float amount, float macro, float drift,
                        float fb_cap, float lp_amt, float wow_hz, float wow_depth,
                        float sat_drive, float flutter_depth, float hiss){
-    float t=SR*(0.03f*powf(40.0f,macro));            /* 30 ms .. 1.2 s exp */
+    float t=(s->sync_time>0.0f)? s->sync_time : SR*(0.03f*powf(40.0f,macro)); /* 30ms..1.2s / synced */
     float fb=amount*fb_cap;
     float wet=clampf(amount*1.4f,0.0f,1.0f);          /* amount=0 → dry */
     for(int i=0;i<n;i++){
@@ -632,7 +658,7 @@ static void fx_reels(slot_dsp_t *s, float *l, float *r, int n,
  * Records forward; plays windowed segments backward. */
 static void fx_reverse(slot_dsp_t *s, float *l, float *r, int n,
                        float amount, float macro, float drift){
-    float seg=SR*(0.08f+macro*0.6f);                 /* 80..680 ms segment */
+    float seg=(s->sync_time>0.0f)? s->sync_time : SR*(0.08f+macro*0.6f); /* 80..680ms / synced */
     float spd=1.0f+(drift>0.0f? wander(&s->f1,&s->seed,0.0008f)*drift*0.05f:0.0f);
     for(int i=0;i<n;i++){
         s->dl_l[s->wp]=l[i]; s->dl_r[s->wp]=r[i];
@@ -649,7 +675,7 @@ static void fx_reverse(slot_dsp_t *s, float *l, float *r, int n,
  * drift=random double-speed/reverse grains. */
 static void fx_collage(slot_dsp_t *s, float *l, float *r, int n,
                        float amount, float macro, float drift){
-    float loop=SR*(0.05f+macro*1.2f);
+    float loop=(s->sync_time>0.0f)? s->sync_time : SR*(0.05f+macro*1.2f);
     float fb=amount*0.9f;
     for(int i=0;i<n;i++){
         /* grain scheduler: f3=grain pos, f4=grain speed, i1=samples left */
@@ -1082,6 +1108,11 @@ static void *create_instance(const char *module_dir, const char *json){
     }
     p->input_vol = 1.0f; p->iv_sm = 1.0f;
     p->mix = 1.0f; p->mix_sm = 1.0f;            /* design-spec: Mix default 100% */
+    p->feedback = 0.0f; p->fb_sm = 0.0f;        /* GLOBAL defaults */
+    p->tempo_src = 0;                           /* 0 = Move clock */
+    p->tempo_bpm = 120;
+    p->time_div = 0;                            /* Free */
+    p->move_bpm = 120.0f; p->clock_interval_sm = (60.0f*SR)/(120.0f*24.0f);
     p->fx_reorder = 0;                          /* 1-2-3-4 */
     p->current_preset = 1;
     p->current_level = 1;                       /* LV_PALETTE — landing mirrors Console knobs */
@@ -1105,7 +1136,7 @@ static void destroy_instance(void *instance){
 /* Levels for page-aware knob overlay. Index 0 = root/Presets (landing). */
 /* Knob-overlay pages. 0 = root/landing (preset+rnd knobs), 1 = Console (the
  * 8-knob amount/macro page), 2/3 = FX slot pages. */
-enum { LV_PRESETS=0, LV_PALETTE, LV_FX12, LV_FX34, NUM_LEVELS };
+enum { LV_PRESETS=0, LV_PALETTE, LV_FX12, LV_FX34, LV_GLOBAL, NUM_LEVELS };
 
 /* knob (1..8) → param key, per level. NULL = unused knob. */
 static const char *LEVEL_KNOBS[NUM_LEVELS][8] = {
@@ -1113,6 +1144,7 @@ static const char *LEVEL_KNOBS[NUM_LEVELS][8] = {
   /* PALETTE */ {"fx1_amount","fx1_macro","fx2_amount","fx2_macro","fx3_amount","fx3_macro","fx4_amount","fx4_macro"},
   /* FX12    */ {"fx1_select","fx1_amount","fx1_macro","fx1_drift","fx2_select","fx2_amount","fx2_macro","fx2_drift"},
   /* FX34    */ {"fx3_select","fx3_amount","fx3_macro","fx3_drift","fx4_select","fx4_amount","fx4_macro","fx4_drift"},
+  /* GLOBAL  */ {"feedback","tempo_src","tempo_bpm","time_div",NULL,NULL,NULL,NULL},
 };
 
 /* parse "fxN_field" → slot index 0..3 (returns -1 if not a slot key) */
@@ -1130,6 +1162,7 @@ static void set_float_key(palette_t *p, const char *key, float v){
     }
     if(!strcmp(key,"mix")) p->mix=clampf(v,0,1);
     else if(!strcmp(key,"input_vol")) p->input_vol=clampf(v,0,2);
+    else if(!strcmp(key,"feedback")) p->feedback=clampf(v,0,1);
 }
 static float get_float_key(palette_t *p, const char *key){
     int s=slot_of(key);
@@ -1139,6 +1172,7 @@ static float get_float_key(palette_t *p, const char *key){
         if(!strcmp(f,"drift"))  return p->slots[s].drift; }
     if(!strcmp(key,"mix")) return p->mix;
     if(!strcmp(key,"input_vol")) return p->input_vol;
+    if(!strcmp(key,"feedback")) return p->feedback;
     return 0;
 }
 
@@ -1167,8 +1201,12 @@ static void apply_knob_delta(palette_t *p, const char *key, int delta){
         return;
     }
     if(!strncmp(key,"rnd_",4)){ return; }  /* momentary enum: fires via direct set_param("1") only */
+    /* GLOBAL discrete params */
+    if(!strcmp(key,"tempo_src")){ p->tempo_src = (delta>0)?1:(delta<0?0:p->tempo_src); return; }
+    if(!strcmp(key,"tempo_bpm")){ p->tempo_bpm = clampi(p->tempo_bpm+delta,10,500); return; }
+    if(!strcmp(key,"time_div")){ p->time_div = clampi(p->time_div+delta,0,NUM_DIVS-1); return; }
     /* floats */
-    float step = (!strcmp(key,"input_vol")) ? 0.01f : 0.01f;
+    float step = 0.01f;
     set_float_key(p,key, get_float_key(p,key)+delta*step);
 }
 
@@ -1182,6 +1220,7 @@ static void set_param(void *instance, const char *key, const char *val){
         else if(!strcmp(val,"Presets")) p->current_level=LV_PRESETS;
         else if(!strcmp(val,"FX12")) p->current_level=LV_FX12;
         else if(!strcmp(val,"FX34")) p->current_level=LV_FX34;
+        else if(!strcmp(val,"Global")) p->current_level=LV_GLOBAL;
         return;
     }
     /* knob_N_adjust — resolve via current level's knob map */
@@ -1214,14 +1253,22 @@ static void set_param(void *instance, const char *key, const char *val){
         if(idx<0) idx=clampi(atoi(val),0,23);
         p->fx_reorder=idx; return;
     }
+    /* GLOBAL page */
+    if(!strcmp(key,"tempo_src")){ p->tempo_src = (!strcmp(val,"Int")||atoi(val)==1)?1:0; return; }
+    if(!strcmp(key,"tempo_bpm")){ p->tempo_bpm = clampi(atoi(val),10,500); return; }
+    if(!strcmp(key,"time_div")){
+        int idx=-1; for(int i=0;i<NUM_DIVS;i++) if(!strcmp(val,DIVS[i].name)){idx=i;break;}
+        if(idx<0) idx=clampi(atoi(val),0,NUM_DIVS-1);
+        p->time_div=idx; return;
+    }
     /* full-state restore (per-Set persistence). CSV: 4×(sel,amt,mac,drf),mix,ivol,ord,preset */
     if(!strcmp(key,"state")){
-        int sel[4],ord=0,pre=1; float a[4],m[4],d[4],mix=1.0f,iv=1.0f;
+        int sel[4],ord=0,pre=1,tsrc=0,tbpm=120,tdiv=0; float a[4],m[4],d[4],mix=1.0f,iv=1.0f,fb=0.0f;
         int got=sscanf(val,
-            "%d,%f,%f,%f,%d,%f,%f,%f,%d,%f,%f,%f,%d,%f,%f,%f,%f,%f,%d,%d",
+            "%d,%f,%f,%f,%d,%f,%f,%f,%d,%f,%f,%f,%d,%f,%f,%f,%f,%f,%d,%d,%f,%d,%d,%d",
             &sel[0],&a[0],&m[0],&d[0], &sel[1],&a[1],&m[1],&d[1],
             &sel[2],&a[2],&m[2],&d[2], &sel[3],&a[3],&m[3],&d[3],
-            &mix,&iv,&ord,&pre);
+            &mix,&iv,&ord,&pre, &fb,&tsrc,&tbpm,&tdiv);
         if(got>=18){
             for(int s=0;s<NUM_SLOTS;s++) slot_apply_select(p,s,PFX_OFF);   /* frees heavy */
             for(int s=0;s<NUM_SLOTS;s++){
@@ -1234,6 +1281,8 @@ static void set_param(void *instance, const char *key, const char *val){
             p->mix=clampf(mix,0,1); p->input_vol=clampf(iv,0,2);
             p->fx_reorder=clampi(ord,0,23);
             if(got>=20) p->current_preset=clampi(pre,1,NUM_PRESETS);
+            if(got>=24){ p->feedback=clampf(fb,0,1); p->tempo_src=clampi(tsrc,0,1);
+                         p->tempo_bpm=clampi(tbpm,10,500); p->time_div=clampi(tdiv,0,NUM_DIVS-1); }
         }
         return;
     }
@@ -1261,7 +1310,8 @@ static int get_param(void *instance, const char *key, char *buf, int buf_len){
           "{\"level\":\"Console\",\"label\":\"PALETTE\"},"
           "{\"level\":\"Presets\",\"label\":\"PRESETS&RND\"},"
           "{\"level\":\"FX12\",\"label\":\"FX 1&2\"},"
-          "{\"level\":\"FX34\",\"label\":\"FX 3&4\"}"
+          "{\"level\":\"FX34\",\"label\":\"FX 3&4\"},"
+          "{\"level\":\"Global\",\"label\":\"GLOBAL\"}"
           "]},"
           "\"Console\":{\"name\":\"PALETTE\","
           "\"knobs\":[\"fx1_amount\",\"fx1_macro\",\"fx2_amount\",\"fx2_macro\",\"fx3_amount\",\"fx3_macro\",\"fx4_amount\",\"fx4_macro\"],"
@@ -1274,7 +1324,10 @@ static int get_param(void *instance, const char *key, char *buf, int buf_len){
           "\"params\":[\"fx1_select\",\"fx1_amount\",\"fx1_macro\",\"fx1_drift\",\"fx2_select\",\"fx2_amount\",\"fx2_macro\",\"fx2_drift\"]},"
           "\"FX34\":{\"name\":\"FX 3&4\","
           "\"knobs\":[\"fx3_select\",\"fx3_amount\",\"fx3_macro\",\"fx3_drift\",\"fx4_select\",\"fx4_amount\",\"fx4_macro\",\"fx4_drift\"],"
-          "\"params\":[\"fx3_select\",\"fx3_amount\",\"fx3_macro\",\"fx3_drift\",\"fx4_select\",\"fx4_amount\",\"fx4_macro\",\"fx4_drift\"]}"
+          "\"params\":[\"fx3_select\",\"fx3_amount\",\"fx3_macro\",\"fx3_drift\",\"fx4_select\",\"fx4_amount\",\"fx4_macro\",\"fx4_drift\"]},"
+          "\"Global\":{\"name\":\"GLOBAL\","
+          "\"knobs\":[\"feedback\",\"tempo_src\",\"tempo_bpm\",\"time_div\"],"
+          "\"params\":[\"feedback\",\"tempo_src\",\"tempo_bpm\",\"time_div\"]}"
           "}}");
         return o;
     }
@@ -1313,6 +1366,14 @@ static int get_param(void *instance, const char *key, char *buf, int buf_len){
         o+=snprintf(buf+o,buf_len-o,"{\"key\":\"fx_reorder\",\"name\":\"FX Reorder\",\"type\":\"enum\",\"options\":[");
         for(int i=0;i<24;i++){ char lb[16]; perm_label(i,lb,sizeof lb);
             o+=snprintf(buf+o,buf_len-o,"%s\"%s\"",i?",":"",lb); }
+        o+=snprintf(buf+o,buf_len-o,"]},");
+        /* ── GLOBAL page ── */
+        o+=snprintf(buf+o,buf_len-o,
+          "{\"key\":\"feedback\",\"name\":\"Feedback\",\"type\":\"float\",\"min\":0,\"max\":1,\"step\":0.01},"
+          "{\"key\":\"tempo_src\",\"name\":\"Tempo Src\",\"type\":\"enum\",\"options\":[\"Move\",\"Int\"]},"
+          "{\"key\":\"tempo_bpm\",\"name\":\"Tempo\",\"type\":\"int\",\"min\":10,\"max\":500,\"step\":1},");
+        o+=snprintf(buf+o,buf_len-o,"{\"key\":\"time_div\",\"name\":\"Time Div\",\"type\":\"enum\",\"options\":[");
+        for(int i=0;i<NUM_DIVS;i++) o+=snprintf(buf+o,buf_len-o,"%s\"%s\"",i?",":"",DIVS[i].name);
         o+=snprintf(buf+o,buf_len-o,"]}");
         o+=snprintf(buf+o,buf_len-o,"]");
         return o;
@@ -1328,6 +1389,10 @@ static int get_param(void *instance, const char *key, char *buf, int buf_len){
     }
     if(!strcmp(key,"mix"))           return snprintf(buf,buf_len,"%.2f",p->mix);
     if(!strcmp(key,"input_vol"))     return snprintf(buf,buf_len,"%.2f",p->input_vol);
+    if(!strcmp(key,"feedback"))      return snprintf(buf,buf_len,"%.4f",p->feedback);  /* raw */
+    if(!strcmp(key,"tempo_src"))     return snprintf(buf,buf_len,"%s",p->tempo_src?"Int":"Move");
+    if(!strcmp(key,"tempo_bpm"))     return snprintf(buf,buf_len,"%d",p->tempo_bpm);
+    if(!strcmp(key,"time_div"))      return snprintf(buf,buf_len,"%s",DIVS[clampi(p->time_div,0,NUM_DIVS-1)].name);
     if(!strcmp(key,"current_preset")){ int pi=clampi(p->current_preset-1,0,NUM_PRESETS-1);
         return snprintf(buf,buf_len,"%d %s",pi+1,PRESETS[pi].name); }
     if(!strcmp(key,"fx_reorder")){ char lb[16]; perm_label(p->fx_reorder,lb,sizeof lb);
@@ -1354,6 +1419,10 @@ static int get_param(void *instance, const char *key, char *buf, int buf_len){
             if(!strcmp(pk,"rnd_amount"))     return snprintf(buf,buf_len,"Rnd Amt");
             if(!strcmp(pk,"rnd_macro"))      return snprintf(buf,buf_len,"Rnd Macro");
             if(!strcmp(pk,"rnd_drift"))      return snprintf(buf,buf_len,"Rnd Drift");
+            if(!strcmp(pk,"feedback"))       return snprintf(buf,buf_len,"Feedback");
+            if(!strcmp(pk,"tempo_src"))      return snprintf(buf,buf_len,"Tempo Src");
+            if(!strcmp(pk,"tempo_bpm"))      return snprintf(buf,buf_len,"Tempo");
+            if(!strcmp(pk,"time_div"))       return snprintf(buf,buf_len,"Time Div");
             return snprintf(buf,buf_len,"%s",pk);
         } else { /* _value */
             if(slot_of(pk)>=0 && !strcmp(pk+4,"select"))
@@ -1361,6 +1430,9 @@ static int get_param(void *instance, const char *key, char *buf, int buf_len){
             if(!strcmp(pk,"current_preset")){ int pi=clampi(p->current_preset-1,0,NUM_PRESETS-1);
                 return snprintf(buf,buf_len,"%d %s",pi+1,PRESETS[pi].name); }
             if(!strncmp(pk,"rnd_",4))        return snprintf(buf,buf_len,"tap");
+            if(!strcmp(pk,"tempo_src"))      return snprintf(buf,buf_len,"%s",p->tempo_src?"Int":"Move");
+            if(!strcmp(pk,"tempo_bpm"))      return snprintf(buf,buf_len,"%d BPM",p->tempo_bpm);
+            if(!strcmp(pk,"time_div"))       return snprintf(buf,buf_len,"%s",DIVS[clampi(p->time_div,0,NUM_DIVS-1)].name);
             return snprintf(buf,buf_len,"%d%%",(int)(get_float_key(p,pk)*100));
         }
     }
@@ -1373,6 +1445,8 @@ static int get_param(void *instance, const char *key, char *buf, int buf_len){
                 p->slots[s].select,p->slots[s].amount,p->slots[s].macro,p->slots[s].drift);
         o+=snprintf(buf+o,buf_len-o,"%.4f,%.4f,%d,%d",
             p->mix,p->input_vol,p->fx_reorder,p->current_preset);
+        o+=snprintf(buf+o,buf_len-o,",%.4f,%d,%d,%d",
+            p->feedback,p->tempo_src,p->tempo_bpm,p->time_div);  /* GLOBAL */
         return o;
     }
 
@@ -1390,14 +1464,32 @@ static void process_block(void *instance, int16_t *buf, int frames){
     float gsm = 1.0f - expf(-(float)frames/(0.020f*SR));     /* 20 ms smooth for globals */
     p->iv_sm  += gsm*(p->input_vol - p->iv_sm);
     p->mix_sm += gsm*(p->mix       - p->mix_sm);
+    p->fb_sm  += gsm*(p->feedback  - p->fb_sm);
     float iv = p->iv_sm;
 
-    /* de-interleave + input volume (dry kept for mix) */
+    /* ── tempo sync: effective BPM → synced delay time + LFO rate for this block ── */
+    float bpm = (p->tempo_src==1) ? (float)p->tempo_bpm
+              : ((p->clock_running && p->move_bpm>=10.0f) ? p->move_bpm : (float)p->tempo_bpm);
+    bpm = clampf(bpm,10.0f,500.0f);
+    float sync_time=0.0f, sync_rate=0.0f;
+    if(p->time_div>0){
+        float npb=DIVS[clampi(p->time_div,0,NUM_DIVS-1)].npb;
+        float tsec=(60.0f/bpm)/npb;
+        sync_time=tsec*SR; if(sync_time>(float)(MAX_DELAY-4)) sync_time=(float)(MAX_DELAY-4);
+        sync_rate=1.0f/tsec;
+    }
+    p->sample_pos += (uint32_t)frames;
+
+    /* de-interleave + input volume + global feedback send (damped + soft-clipped) */
     float dryL[MAXFRAMES], dryR[MAXFRAMES];
     for(int i=0;i<frames;i++){
         float l=buf[2*i]/32768.0f, r=buf[2*i+1]/32768.0f;
         dryL[i]=l; dryR[i]=r;
-        p->L[i]=l*iv; p->R[i]=r*iv;
+        p->fb_lp_l += 0.3f*(p->fbL[i]-p->fb_lp_l)+DENORM;   /* damp the regen path */
+        p->fb_lp_r += 0.3f*(p->fbR[i]-p->fb_lp_r)+DENORM;
+        float fbl=sb_tanh(p->fb_lp_l*p->fb_sm*1.1f);        /* bounded regeneration */
+        float fbr=sb_tanh(p->fb_lp_r*p->fb_sm*1.1f);
+        p->L[i]=l*iv+fbl; p->R[i]=r*iv+fbr;
     }
     /* run the 4 slots in reorder sequence (Off = passthrough, never dispatched).
      * Clouds effects dispatch through the opaque heavy interface; C effects use the
@@ -1414,6 +1506,8 @@ static void process_block(void *instance, int16_t *buf, int frames){
         sl->amt_sm += psm*(sl->amount - sl->amt_sm);
         sl->mac_sm += psm*(sl->macro  - sl->mac_sm);
         sl->drf_sm += psm*(sl->drift  - sl->drf_sm);
+        sl->dsp.sync_time = sync_time;     /* tempo sync (0 = free-running) */
+        sl->dsp.sync_rate = sync_rate;
         int ramping = sl->ramp < 1.0f;
         if(ramping){ memcpy(preL,p->L,frames*sizeof(float)); memcpy(preR,p->R,frames*sizeof(float)); }
         if(is_clouds_fx(fx)){
@@ -1436,11 +1530,15 @@ static void process_block(void *instance, int16_t *buf, int frames){
             sl->ramp = rr + ramp_inc*(float)frames; if(sl->ramp>1.0f) sl->ramp=1.0f;
         }
     }
-    /* equal-power dry/wet + write back (NaN-guarded — many effects feed back) */
+    /* equal-power dry/wet + write back (NaN-guarded — many effects feed back).
+     * The wet chain output is stashed as next block's feedback source. */
     float a=p->mix_sm*1.5707963f, dg=cosf(a), wg=sinf(a);
     for(int i=0;i<frames;i++){
-        float ol=dg*dryL[i]+wg*p->L[i];
-        float orr=dg*dryR[i]+wg*p->R[i];
+        float wl=p->L[i], wr=p->R[i];
+        if(wl!=wl) wl=0.0f; if(wr!=wr) wr=0.0f;
+        p->fbL[i]=wl; p->fbR[i]=wr;                 /* feedback source for next block */
+        float ol=dg*dryL[i]+wg*wl;
+        float orr=dg*dryR[i]+wg*wr;
         if(ol!=ol) ol=0.0f; if(orr!=orr) orr=0.0f;
         int32_t il=(int32_t)(ol*32767.0f), ir=(int32_t)(orr*32767.0f);
         if(il>32767)il=32767; if(il<-32768)il=-32768;
@@ -1449,12 +1547,39 @@ static void process_block(void *instance, int16_t *buf, int frames){
     }
 }
 
+/* ── MIDI: derive Move tempo from host clock (24 PPQN). Only used when GLOBAL
+ *  Tempo Src = Move; Int always works without this. ───────────────────────────── */
+static void on_midi(void *instance, const uint8_t *msg, int len, int source){
+    palette_t *p=(palette_t*)instance; if(!p||!msg||len<1) return;
+    (void)source;
+    uint8_t st=msg[0];
+    if(st==0xFA||st==0xFB){ p->clock_running=1; p->clock_count=0; p->last_clock_sample=p->sample_pos; }
+    else if(st==0xFC){ p->clock_running=0; }
+    else if(st==0xF8){ /* timing clock — measure samples per quarter (24 pulses) */
+        p->clock_running=1;
+        if(++p->clock_count>=24){
+            uint32_t now=p->sample_pos, dq=now - p->last_clock_sample;
+            p->last_clock_sample=now; p->clock_count=0;
+            if(dq>2000 && dq<SR*6){                    /* sane: 10..~440 BPM */
+                p->clock_interval_sm += 0.25f*((float)dq - p->clock_interval_sm);
+                float b=60.0f*SR/p->clock_interval_sm;
+                p->move_bpm = clampf(b,10.0f,500.0f);
+            }
+        }
+    }
+}
+
 /* ── API v2 export ───────────────────────────────────────────────────────────── */
 static audio_fx_api_v2_t g_api = {
     .api_version=2, .create_instance=create_instance, .destroy_instance=destroy_instance,
-    .process_block=process_block, .set_param=set_param, .get_param=get_param, .on_midi=NULL,
+    .process_block=process_block, .set_param=set_param, .get_param=get_param, .on_midi=on_midi,
 };
 __attribute__((visibility("default")))
 audio_fx_api_v2_t* move_audio_fx_init_v2(const host_api_v1_t *host){
     g_host=host; if(host&&host->log) host->log("[palette] loaded"); return &g_api;
+}
+/* Also export on_midi by name (some host builds dlsym it). */
+__attribute__((visibility("default")))
+void move_audio_fx_on_midi(void *instance, const uint8_t *msg, int len, int source){
+    on_midi(instance,msg,len,source);
 }

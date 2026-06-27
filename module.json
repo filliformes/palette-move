@@ -12,6 +12,7 @@
     "chainable": true,
     "component_type": "audio_fx",
     "audio_in": true,
+    "midi_in": true,
     "ui_hierarchy": {
       "modes": null,
       "levels": {
