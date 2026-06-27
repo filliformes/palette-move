@@ -24,20 +24,22 @@ table is authoritative — the per-effect "plan" further down is historical.
 | INTERFERENCE | ported | Airwindows **DeRez2** rate/µ-law/bit crush (MIT) + orig ring-mod |
 | FOLD | ported | real Warps `lut_bipolar_fold` curve (MIT) — `warps_data.c` |
 | SHIFT | ported | real Warps `QuadratureTransform` 17-pole Hilbert (MIT) — `warps_data.c` |
-| SWEETEN | **original C** | console-preamp topology, not ported |
-| HOWL | **original C** | SVF resonant filter-fuzz, not ported |
-| SWELL | **original C** | envelope auto-swell, not ported |
+| TREMOLO | ported | Airwindows **Tremolo** skew/density + chase smoothing (MIT) |
+| SWELL | ported | Airwindows **Swell** hysteresis gate + Zeno poles (MIT) |
+| SWEETEN | ported+orig | Airwindows **Density** sin-fold sat + Air-style HF tilt (MIT) |
+| HOWL | reference | Cytomic/TPT **SVF** (Andrew Simper, stable) + drive — textbook, not a copy |
+| VIBRATO | reference | Airwindows **Vibrato** through-zero FM + HF restore (technique) |
+| PHASER | reference | frequency-accurate allpass `a=(g-1)/(g+1)` (Surge-style), not a copy |
 | DOUBLER | **original C** | ADT modulated delay, not ported |
-| VIBRATO | **original C** | modulated delay, not ported |
-| PHASER | **original C** | N-stage allpass cascade, not ported |
-| TREMOLO | **original C** | LFO×gain, not ported |
 | PITCH | **original C** | dual-tap delay pitch shift, not ported |
 | COLLAGE | **original C** | granular looping delay, not ported |
 | REVERSE | **original C** | windowed reverse delay, not ported |
 | BROKEN | **original C** | motor-failure pitch drop, not ported |
 
-> v2 candidates for further re-sourcing: Airwindows for Sweeten (ToTape/Density), Howl,
-> Tremolo (Tremolo), Pitch; Signalsmith `delay.h` for Doubler/Vibrato/Reverse.
+> After the review pass: **19/24 effects reference professional DSP** (13 ported verbatim/
+> data + 6 improved against Airwindows/Surge/Cytomic references). 5 remain fully original
+> (Doubler, Pitch, Collage, Reverse, Broken) — reviewed and judged musically fine as-is.
+> Reference sources vendored: `vendor/airwindows/{Tremolo,Swell,Vibrato,Chorus}`.
 
 ---
 

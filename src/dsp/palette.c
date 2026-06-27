@@ -281,13 +281,14 @@ static void fx_drive(slot_dsp_t *s, float *l, float *r, int n,
     }
 }
 
-/* SWEETEN — console preamp: low-shelf warmth + gentle comp + light sat.
- * amount=comp/sat, macro=tone (tilt), drift=subtle level drift. */
+/* SWEETEN — console preamp. Gentle comp + the Airwindows Density sin-fold
+ * saturator (Chris Johnson, MIT) for body, + an Air-style HF tilt shelf.
+ * amount=comp/sat, macro=tone (dark↔air), drift=subtle level drift. */
 static void fx_sweeten(slot_dsp_t *s, float *l, float *r, int n,
                        float amount, float macro, float drift){
     float tilt=(macro-0.5f)*2.0f;
-    float thr=0.5f, ratio=0.35f+amount*0.4f;        /* gentle */
-    float sat=0.3f+amount*0.9f;
+    float thr=0.5f, ratio=0.35f+amount*0.4f;         /* gentle comp */
+    float density=amount*2.5f, dwet=clampf(density,0.0f,1.0f);  /* Density sat amount */
     for(int i=0;i<n;i++){
         float mono=0.5f*(fabsf(l[i])+fabsf(r[i]));
         s->env += (mono>s->env?0.02f:0.004f)*(mono-s->env)+DENORM;  /* fast atk slow rel */
@@ -295,10 +296,14 @@ static void fx_sweeten(slot_dsp_t *s, float *l, float *r, int n,
         float dl=(drift>0.0f)? 1.0f+wander(&s->f1,&s->seed,0.0004f)*drift*0.03f : 1.0f;
         for(int ch=0;ch<2;ch++){
             float x=(ch?r:l)[i]*gr*dl;
+            /* Airwindows Density sin-fold saturator */
+            float br=fabsf(x*(1.0f+density)); if(br>1.57079633f)br=1.57079633f; br=sinf(br);
+            float sat=(x>0.0f)? x*(1.0f-dwet)+br*dwet : x*(1.0f-dwet)-br*dwet;
+            /* Air-style HF tilt shelf (macro) */
             float *z=ch?&s->z1r:&s->z1l;
-            *z += 0.10f*(x-*z)+DENORM;               /* LP for tilt */
-            float t=(tilt>=0.0f)? lerpf(x,(x-*z)*1.8f,tilt) : lerpf(x,*z*1.5f,-tilt);
-            (ch?r:l)[i]=tanhf(t*sat)/ (0.6f+0.4f*sat);
+            *z += 0.10f*(sat-*z)+DENORM;              /* LP component */
+            (ch?r:l)[i]=(tilt>=0.0f)? sat+(sat-*z)*tilt*1.6f      /* brighten = air */
+                                    : lerpf(sat,*z,-tilt);        /* darken */
         }
     }
 }
@@ -322,42 +327,55 @@ static void fx_fuzz(slot_dsp_t *s, float *l, float *r, int n,
     }
 }
 
-/* HOWL — resonant filter-fuzz / synth stab. amount=intensity (drive+res),
- * macro=resonant frequency, drift=res-freq wander. SVF bandpass self-osc. */
+/* HOWL — resonant filter-fuzz / synth stab. Cytomic/TPT state-variable filter
+ * (Andrew Simper, topology-preserving — unconditionally stable at high freq/Q,
+ * unlike the Chamberlin SVF). Bandpass voiced into soft clip. amount=intensity
+ * (drive + resonance), macro=resonant freq, drift=res-freq wander.
+ * State per ch: lp_*=ic1eq, bp_*=ic2eq. */
 static void fx_howl(slot_dsp_t *s, float *l, float *r, int n,
                     float amount, float macro, float drift){
     float base=120.0f*powf(40.0f,macro);             /* 120..4800 Hz */
-    float q=0.5f+amount*0.45f;                        /* toward self-osc */
+    float fz=base*(drift>0.0f?(1.0f+wander(&s->f1,&s->seed,0.0008f)*drift*0.5f):1.0f);
+    float g=tanf(3.14159265f*clampf(fz,40.0f,9000.0f)/SR);
+    float k=1.0f-amount*0.93f;                        /* damping (1/Q) → high res near 0 */
+    float a1=1.0f/(1.0f+g*(g+k)), a2=g*a1, a3=g*a2;
     float drive=1.0f+amount*amount*12.0f;
-    for(int i=0;i<n;i++){
-        float fz=base*(drift>0.0f?(1.0f+wander(&s->f1,&s->seed,0.0008f)*drift*0.5f):1.0f);
-        float f=2.0f*sinf(3.14159265f*clampf(fz,40.0f,9000.0f)/SR);
-        float fb=1.0f-q;
-        for(int ch=0;ch<2;ch++){
-            float *lp=ch?&s->lp_r:&s->lp_l; float *bp=ch?&s->bp_r:&s->bp_l;
-            float x=tanhf((ch?r:l)[i]*drive);
-            *lp += f*(*bp)+DENORM;
-            float hp=x-*lp-fb*(*bp);
-            *bp += f*hp+DENORM;
-            (ch?r:l)[i]=tanhf((*bp)*(0.8f+amount))*0.9f;   /* bandpass voiced */
+    float voice=0.8f+amount;
+    for(int ch=0;ch<2;ch++){
+        float *ic1=ch?&s->lp_r:&s->lp_l, *ic2=ch?&s->bp_r:&s->bp_l;
+        float *src=ch?r:l;
+        for(int i=0;i<n;i++){
+            float x=tanhf(src[i]*drive);
+            float v3=x-*ic2;
+            float v1=a1*(*ic1)+a2*v3;
+            float v2=*ic2+a2*(*ic1)+a3*v3;
+            *ic1=2.0f*v1-*ic1+DENORM; *ic2=2.0f*v2-*ic2+DENORM;
+            src[i]=tanhf(v1*voice)*0.9f;              /* v1 = bandpass */
         }
     }
 }
 
-/* SWELL — auto volume-swell (slow-gear). amount=swell time, macro=sensitivity,
- * drift=threshold jitter. Suppresses attacks, fades volume in. */
+/* SWELL — auto volume-swell. Hysteresis gate + Zeno-pole envelopes from Airwindows
+ * Swell (Chris Johnson, MIT): separate on/off thresholds (no chatter) and separate
+ * attack/release "Zeno arrow" poles. amount=swell time, macro=sensitivity,
+ * drift=threshold jitter. State: i1/i2=louder L/R, sm1/sm2=swell gain L/R. */
 static void fx_swell(slot_dsp_t *s, float *l, float *r, int n,
                      float amount, float macro, float drift){
-    float atk=0.0008f/(1.0f+amount*amount*40.0f);    /* longer swell = slower rise */
-    float rel=0.004f;
-    float sens=0.02f+(1.0f-macro)*0.2f;
+    float sens=0.02f+(1.0f-macro)*0.28f;             /* on-threshold */
+    float speedOn =0.00015f+(1.0f-amount)*0.0028f;   /* longer swell = slower rise */
+    float speedOff=0.0008f;                           /* gentle fade-out */
     for(int i=0;i<n;i++){
-        float mono=0.5f*(fabsf(l[i])+fabsf(r[i]));
-        s->env += (mono>s->env?0.05f:0.001f)*(mono-s->env)+DENORM;  /* input env */
-        float th=sens*(drift>0.0f?(1.0f+wander(&s->f1,&s->seed,0.003f)*drift*0.6f):1.0f);
-        float tgt=(s->env>th)?1.0f:0.0f;                 /* gate the swell target */
-        s->sm1 += (tgt>s->sm1?atk:rel)*(tgt-s->sm1)+DENORM; /* swell gain */
-        l[i]*=s->sm1; r[i]*=s->sm1;
+        float thOn=sens*(drift>0.0f?(1.0f+wander(&s->f1,&s->seed,0.003f)*drift*0.5f):1.0f);
+        float thOff=thOn*0.5f;                        /* hysteresis: off < on */
+        for(int ch=0;ch<2;ch++){
+            float x=(ch?r:l)[i]; float a=fabsf(x);
+            int *louder=ch?&s->i2:&s->i1; float *sw=ch?&s->sm2:&s->sm1;
+            if(a>thOn && !*louder) *louder=1;
+            if(a<thOff && *louder) *louder=0;
+            if(*louder) *sw = *sw*(1.0f-speedOn)+speedOn;   /* Zeno → 1 */
+            else        *sw = *sw*(1.0f-speedOff);          /* Zeno → 0 */
+            (ch?r:l)[i]=x*(*sw);
+        }
     }
 }
 
@@ -410,27 +428,40 @@ static void fx_doubler(slot_dsp_t *s, float *l, float *r, int n,
     }
 }
 
-/* VIBRATO — modulated delay (no dry). amount=depth, macro=rate,
- * drift=sine→random waveshape. */
+/* VIBRATO — modulated delay (no dry). Adds the Airwindows Vibrato character:
+ * a 2nd LFO through-zero-FMs the primary sweep (richer than a single sine), plus
+ * an HF restore to offset linear-interpolation dulling. amount=depth, macro=rate,
+ * drift=sine→random waveshape + FM depth. lfo=main phase, lfo2=FM phase. */
 static void fx_vibrato(slot_dsp_t *s, float *l, float *r, int n,
                        float amount, float macro, float drift){
     float rate=0.5f+macro*7.5f;                      /* 0.5..8 Hz */
     float depth=SR*0.0005f*(0.3f+amount*4.0f);       /* mod depth in samples */
     float base=SR*0.006f;
+    float fmRate=rate*1.61f;                          /* incommensurate 2nd LFO */
+    float fmDepth=0.4f+drift*0.6f;                    /* through-zero FM amount */
     for(int i=0;i<n;i++){
-        s->lfo+=rate/SR; if(s->lfo>=1.0f)s->lfo-=1.0f;
+        s->lfo2+=fmRate/SR; if(s->lfo2>=1.0f)s->lfo2-=1.0f;
+        s->lfo+=(rate*(1.0f+fmDepth*0.5f*sinf(s->lfo2*TWO_PI)))/SR;  /* through-zero FM */
+        if(s->lfo>=1.0f)s->lfo-=1.0f; if(s->lfo<0.0f)s->lfo+=1.0f;
         float sine=sinf(s->lfo*TWO_PI);
         float rnd=(drift>0.0f? wander(&s->f1,&s->seed,0.02f):0.0f);
         float mod=lerpf(sine,rnd,clampf(drift,0.0f,0.9f));
         float d=base+depth*(1.0f+mod);
         s->dl_l[s->wp]=l[i]; s->dl_r[s->wp]=r[i];
-        l[i]=dlr(s->dl_l,s->wp,d); r[i]=dlr(s->dl_r,s->wp,d);
+        float oL=dlr(s->dl_l,s->wp,d), oR=dlr(s->dl_r,s->wp,d);
+        /* HF restore: high-shelf the interpolation loss back in (one-pole HP add) */
+        s->z1l+=0.4f*(oL-s->z1l)+DENORM; oL+=(oL-s->z1l)*0.25f;
+        s->z1r+=0.4f*(oR-s->z1r)+DENORM; oR+=(oR-s->z1r)*0.25f;
+        l[i]=oL; r[i]=oR;
         s->wp=(s->wp+1)%MAX_DELAY;
     }
 }
 
-/* PHASER — N-stage allpass cascade + feedback. amount=intensity/stages,
- * macro=rate, drift=waveform randomness. */
+/* PHASER — N-stage allpass cascade + feedback. Frequency-accurate: the LFO sweeps
+ * the notch frequency in Hz and the first-order allpass coefficient is derived as
+ * a=(g-1)/(g+1), g=tan(π·fc/SR) — so notches sit at musical frequencies (Surge-style)
+ * instead of a raw 0–1 coefficient. amount=intensity/stages, macro=rate,
+ * drift=sweep randomness. */
 static void fx_phaser(slot_dsp_t *s, float *l, float *r, int n,
                       float amount, float macro, float drift){
     int stages=2+(int)(amount*10.0f); if(stages>12)stages=12;  /* 2..12 */
@@ -440,7 +471,9 @@ static void fx_phaser(slot_dsp_t *s, float *l, float *r, int n,
         s->lfo+=rate/SR; if(s->lfo>=1.0f)s->lfo-=1.0f;
         float rnd=(drift>0.0f? wander(&s->f2,&s->seed,0.01f)*drift*0.4f:0.0f);
         float sweep=0.5f+0.5f*sinf(s->lfo*TWO_PI)+rnd;
-        float coef=0.05f+0.9f*clampf(sweep,0.0f,1.0f); /* allpass coefficient */
+        float fc=200.0f*powf(16.0f,clampf(sweep,0.0f,1.0f));    /* 200 Hz .. 3.2 kHz */
+        float g=tanf(3.14159265f*clampf(fc,30.0f,12000.0f)/SR);
+        float coef=(g-1.0f)/(g+1.0f);                           /* allpass coefficient */
         for(int ch=0;ch<2;ch++){
             float *ap=ch?s->ap_r:s->ap_l; float *fbz=ch?&s->z2r:&s->z2l;
             float x=(ch?r:l)[i]+ *fbz*fb;
@@ -454,22 +487,39 @@ static void fx_phaser(slot_dsp_t *s, float *l, float *r, int n,
     }
 }
 
-/* TREMOLO — amp mod, sine→square morph. amount=depth, macro=rate,
- * drift=amp/freq variation. */
+/* TREMOLO — PORTED from Airwindows Tremolo (Chris Johnson, MIT): per-block
+ * param-chase smoothing (zipper-free) + skew/density waveshaping that morphs the
+ * modulation from soft (sine-of-sine) to hard (1-cos) with depth. amount=depth,
+ * macro=rate, drift=rate wander. State: sm1/sm2=chased speed/depth, f4/f5=last
+ * targets, lfo=sweep phase (radians). */
 static void fx_tremolo(slot_dsp_t *s, float *l, float *r, int n,
                        float amount, float macro, float drift){
-    float rate=0.5f+macro*11.5f;                     /* 0.5..12 Hz */
-    float shape=clampf(amount,0.0f,1.0f);            /* deeper = squarer */
+    float speedChase=macro*macro*macro*macro;          /* A^4 (Airwindows) */
+    float depthChase=clampf(amount,0.0f,1.0f);
+    float speedSpeed=300.0f/(fabsf(s->f4-speedChase)+1.0f);
+    float depthSpeed=300.0f/(fabsf(s->f5-depthChase)+1.0f);
+    s->f4=speedChase; s->f5=depthChase;
     for(int i=0;i<n;i++){
-        float fr=rate*(drift>0.0f?(1.0f+wander(&s->f2,&s->seed,0.002f)*drift*0.15f):1.0f);
-        s->lfo+=fr/SR; if(s->lfo>=1.0f)s->lfo-=1.0f;
-        float sine=sinf(s->lfo*TWO_PI);
-        float sq=tanhf(sine*4.0f);                    /* soft square */
-        float w=lerpf(sine,sq,shape);
-        float amp=(drift>0.0f? wander(&s->f1,&s->seed,0.002f)*drift*0.1f:0.0f);
-        float g=1.0f-amount*(0.5f*(1.0f+w)) + amp;
-        g=clampf(g,0.0f,1.2f);
-        l[i]*=g; r[i]*=g;
+        s->sm1=((s->sm1*speedSpeed)+speedChase)/(speedSpeed+1.0f);
+        s->sm2=((s->sm2*depthSpeed)+depthChase)/(depthSpeed+1.0f);
+        float drf=(drift>0.0f? wander(&s->f2,&s->seed,0.002f)*drift*0.2f:0.0f);
+        float speed=(0.0001f+(s->sm1/1000.0f))*(1.0f+drf);
+        float skew=1.0f+powf(s->sm2,9.0f);
+        float density=((1.0f-s->sm2)*2.0f)-1.0f;
+        float offset=sinf(s->lfo);
+        s->lfo+=speed; if(s->lfo>TWO_PI)s->lfo-=TWO_PI;
+        float control=fabsf(offset);
+        if(density>0.0f) control=control*(1.0f-density)+sinf(control)*density;
+        else             control=control*(1.0f+density)+(1.0f-cosf(control))*(-density);
+        float thickness=((control*2.0f)-1.0f)*skew;
+        float out=fabsf(thickness);
+        for(int ch=0;ch<2;ch++){
+            float x=(ch?r:l)[i];
+            float br=fabsf(x); if(br>1.57079633f)br=1.57079633f;
+            br=(thickness>0.0f)? sinf(br) : (1.0f-cosf(br));
+            float y=(x>0.0f)? x*(1.0f-out)+br*out : x*(1.0f-out)-br*out;
+            (ch?r:l)[i]=y;
+        }
     }
 }
 
