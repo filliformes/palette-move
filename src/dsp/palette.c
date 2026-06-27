@@ -216,8 +216,8 @@ static void perm_label(int idx, char *buf, int n){
 }
 
 /* ── Tempo-sync time divisions. npb = notes-per-beat (1/4 = 1). ──────────────── */
-typedef struct { const char *name; float npb; } div_t;
-static const div_t DIVS[] = {
+typedef struct { const char *name; float npb; } tdiv_t;
+static const tdiv_t DIVS[] = {
     {"Free",0.0f}, {"1/1",0.25f}, {"1/2",0.5f}, {"1/2T",0.75f}, {"1/2D",0.33333f},
     {"1/4",1.0f}, {"1/4T",1.5f}, {"1/4D",0.66667f}, {"1/8",2.0f}, {"1/8T",3.0f},
     {"1/8D",1.33333f}, {"1/16",4.0f}, {"1/16T",6.0f}, {"1/16D",2.66667f}, {"1/32",8.0f}

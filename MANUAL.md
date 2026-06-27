@@ -1,9 +1,9 @@
 # PALETTE — User Manual
 
 **A 4-slot serial multi-effect for Ableton Move (Schwung), with a shared palette of 24 effects.**
-Inspired by the Hologram Electronics *Chroma Console* — reorderable-module soul + DRIFT
-instability philosophy — but with more live flexibility, a genuinely stereo signal path, and
-four new originals the Chroma doesn't have.
+Inspired by the Hologram Electronics [*Chroma Console*](https://www.hologramelectronics.com/products/chroma-console?variant=50128739533104) —
+reorderable-module soul + DRIFT instability philosophy — but with more live flexibility, a
+genuinely stereo signal path, and four new originals the Chroma doesn't have.
 
 > **Status: v0.1.0, in testing.** Shared for feedback before public release. The **GLOBAL**
 > page (feedback + tempo sync) is the newest addition and still being validated on hardware.
