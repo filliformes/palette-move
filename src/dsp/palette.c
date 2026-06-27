@@ -598,24 +598,36 @@ static void fx_collage(slot_dsp_t *s, float *l, float *r, int n,
 
 /* FILTER — multimode Tilt/LP/HP (SVF) with resonance. amount=cutoff,
  * macro=mode (0 LP · 0.5 tilt · 1 HP), drift=cutoff wander. */
+/* PORTED from Airwindows Capacitor (Chris Johnson, MIT): leaky-integrator pole
+ * recurrence with per-block "chased" cutoff smoothing. Capacitor rotates 6 poles;
+ * we cascade 3 HP + 3 LP every sample. macro morphs LP · flat · HP; amount=cutoff.
+ * State: ap[0..2]=HP poles, ap[3..5]=LP poles (per ch); sm1/sm2=chased amounts;
+ * f4/f5=last chase targets; f1=drift. */
 static void fx_filter(slot_dsp_t *s, float *l, float *r, int n,
                       float amount, float macro, float drift){
-    float cutoff=60.0f*powf(280.0f,amount);          /* 60..16.8k Hz */
-    float lpw=clampf(1.0f-macro*2.0f,0.0f,1.0f);     /* 0..0.5 → LP */
-    float hpw=clampf(macro*2.0f-1.0f,0.0f,1.0f);     /* 0.5..1 → HP */
-    float bpw=1.0f-lpw-hpw;                            /* center → flat/tilt */
-    float q=0.4f;
+    float lp_mode=clampf(1.0f-macro*2.0f,0.0f,1.0f);  /* LP active in low half */
+    float hp_mode=clampf(macro*2.0f-1.0f,0.0f,1.0f);  /* HP active in high half */
+    float amt=clampf(amount,0.0f,1.0f);
+    if(drift>0.0f) amt=clampf(amt+wander(&s->f1,&s->seed,0.0007f)*drift*0.3f,0.0f,1.0f);
+    float a2=amt*amt;
+    float lowpassChase =lerpf(1.0f,a2,lp_mode);       /* 1 = open */
+    float highpassChase=lerpf(0.0f,a2,hp_mode);       /* 0 = open */
+    float lowpassSpeed =300.0f/(fabsf(s->f4-lowpassChase )+1.0f);
+    float highpassSpeed=300.0f/(fabsf(s->f5-highpassChase)+1.0f);
+    s->f4=lowpassChase; s->f5=highpassChase;
     for(int i=0;i<n;i++){
-        float fz=cutoff*(drift>0.0f?(1.0f+wander(&s->f1,&s->seed,0.0007f)*drift*0.4f):1.0f);
-        float f=2.0f*sinf(3.14159265f*clampf(fz,20.0f,18000.0f)/SR);
-        float fb=1.0f-q;
+        s->sm1=((s->sm1*lowpassSpeed)+lowpassChase )/(lowpassSpeed +1.0f); float invLP=1.0f-s->sm1;
+        s->sm2=((s->sm2*highpassSpeed)+highpassChase)/(highpassSpeed+1.0f); float invHP=1.0f-s->sm2;
         for(int ch=0;ch<2;ch++){
-            float *lp=ch?&s->lp_r:&s->lp_l; float *bp=ch?&s->bp_r:&s->bp_l;
+            float *hp=ch?s->ap_r:s->ap_l, *lpp=(ch?s->ap_r:s->ap_l)+3;
             float x=(ch?r:l)[i];
-            *lp+=f*(*bp)+DENORM;
-            float hp=x-*lp-fb*(*bp);
-            *bp+=f*hp+DENORM;
-            (ch?r:l)[i]=lpw*(*lp)+hpw*hp+bpw*x;       /* tilt = blend lp/hp/dry */
+            hp[0]=hp[0]*invHP + x*s->sm2 + DENORM; x-=hp[0];   /* 3 highpass poles */
+            hp[1]=hp[1]*invHP + x*s->sm2 + DENORM; x-=hp[1];
+            hp[2]=hp[2]*invHP + x*s->sm2 + DENORM; x-=hp[2];
+            lpp[0]=lpp[0]*invLP + x*s->sm1 + DENORM; x=lpp[0]; /* 3 lowpass poles */
+            lpp[1]=lpp[1]*invLP + x*s->sm1 + DENORM; x=lpp[1];
+            lpp[2]=lpp[2]*invLP + x*s->sm1 + DENORM; x=lpp[2];
+            (ch?r:l)[i]=x;
         }
     }
 }
@@ -717,25 +729,60 @@ static void fx_broken(slot_dsp_t *s, float *l, float *r, int n,
     }
 }
 
-/* INTERFERENCE — telecom/radio static: bitcrush + sample-rate reduce + ring-mod
- * + noise bursts. amount=intensity, macro=tone/carrier, drift=static randomness. */
+/* INTERFERENCE — lo-fi telecom/radio destruction. Core PORTED from Airwindows
+ * DeRez2 (Chris Johnson, MIT): sample-rate reduction + soften + µ-law encode +
+ * bit-depth quantize. Ring-mod carrier (macro) + static bursts (drift) on top.
+ * amount=crush intensity, macro=carrier/tone, drift=static. State: z1=lastSample,
+ * z2=heldSample, z3=lastDry, z4=lastOut (per ch); f1=position, f2/f3=incrA/incrB. */
 static void fx_interference(slot_dsp_t *s, float *l, float *r, int n,
                             float amount, float macro, float drift){
-    int hold=1+(int)(amount*amount*30.0f);           /* sample-rate reduce */
-    float bits=1.0f+(1.0f-amount)*14.0f; float q=powf(2.0f,bits);
-    float carr=200.0f+macro*macro*3000.0f;            /* ring-mod carrier */
-    float bp=0.05f+macro*0.4f;
+    float A=clampf(amount,0.0f,1.0f);
+    float targetA=A*A*A+0.0005f; if(targetA>1.0f)targetA=1.0f;
+    float soften=(1.0f+targetA)/2.0f;
+    float targetB=powf(1.0f-A,3.0f)/3.0f;             /* bit depth derez */
+    float hard=0.3f;
+    float carr=200.0f+macro*macro*3000.0f;
+    const float L256=logf(256.0f);
     for(int i=0;i<n;i++){
-        if(s->i1<=0){ s->i1=hold; s->f3=l[i]; s->f4=r[i]; }  /* S&H */
-        s->i1--;
-        float xL=floorf(s->f3*q)/q, xR=floorf(s->f4*q)/q;     /* bitcrush */
+        s->f2=((s->f2*999.0f)+targetA)/1000.0f;        /* incrementA (rate) */
+        s->f3=((s->f3*999.0f)+targetB)/1000.0f;        /* incrementB (bits) */
+        s->f1+=s->f2;                                  /* position */
+        float in[2]={l[i],r[i]};
+        float out[2]={s->z2l,s->z2r};                  /* outputSample = heldSample */
+        if(s->f1>1.0f){
+            s->f1-=1.0f;
+            float last[2]={s->z1l,s->z1r};
+            float h0=last[0]*s->f1+in[0]*(1.0f-s->f1);
+            float h1=last[1]*s->f1+in[1]*(1.0f-s->f1);
+            out[0]=out[0]*(1.0f-soften)+h0*soften;
+            out[1]=out[1]*(1.0f-soften)+h1*soften;
+            s->z2l=h0; s->z2r=h1;                      /* heldSample */
+        }
+        s->z1l=in[0]; s->z1r=in[1];                    /* lastSample */
+        float lastOut[2]={s->z4l,s->z4r};
+        float lastDry[2]={s->z3l,s->z3r};
+        for(int c=0;c<2;c++){
+            float x=out[c];
+            if(x!=lastOut[c]){ float t=x; x=x*hard+lastDry[c]*(1.0f-hard); lastOut[c]=t; }
+            else lastOut[c]=x;
+            float temp=x;
+            if(x>1.0f)x=1.0f; else if(x<-1.0f)x=-1.0f;  /* µ-law encode */
+            if(x>0.0f) x= logf(1.0f+255.0f*fabsf(x))/L256;
+            else if(x<0.0f) x=-logf(1.0f+255.0f*fabsf(x))/L256;
+            x=temp*hard + x*(1.0f-hard);
+            if(s->f3>0.0005f){                          /* bit-depth quantize */
+                float t2=x;
+                if(x>0.0f){ while(t2>0.0f) t2-=s->f3; x-=t2; }
+                else if(x<0.0f){ while(t2<0.0f) t2+=s->f3; x-=t2; }
+            }
+            x=lerpf(x, x*sinf(s->lfo*TWO_PI), macro*0.4f);  /* ring-mod radio */
+            if(drift>0.0f && frand(&s->seed)<drift*0.04f) x+=(frand(&s->seed)-0.5f)*drift;
+            out[c]=x;
+        }
+        s->z3l=in[0]; s->z3r=in[1];                    /* lastDry = dry input */
+        s->z4l=lastOut[0]; s->z4r=lastOut[1];
         s->lfo+=carr/SR; if(s->lfo>=1.0f)s->lfo-=1.0f;
-        float rm=sinf(s->lfo*TWO_PI);
-        xL=lerpf(xL,xL*rm,amount*0.5f); xR=lerpf(xR,xR*rm,amount*0.5f);
-        /* telecom bandpass (one-pole HP+LP) */
-        s->z1l+=bp*(xL-s->z1l)+DENORM; s->z1r+=bp*(xR-s->z1r)+DENORM;
-        float nz=(drift>0.0f && frand(&s->seed)<drift*0.05f)?(frand(&s->seed)-0.5f)*drift:0.0f;
-        l[i]=lerpf(l[i],s->z1l+nz,amount); r[i]=lerpf(r[i],s->z1r+nz,amount);
+        l[i]=out[0]; r[i]=out[1];
     }
 }
 
