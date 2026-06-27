@@ -289,7 +289,7 @@ static void fx_passthrough(slot_dsp_t *s, float *l, float *r, int n,
  * (asymmetric Padé tanh). amount=drive, macro=tone tilt, drift=slow bias wander. */
 static void fx_drive(slot_dsp_t *s, float *l, float *r, int n,
                      float amount, float macro, float drift){
-    float g    = 1.0f + amount*amount*23.0f;        /* quadratic: fine low end */
+    float g    = 1.0f + amount*9.0f + amount*amount*36.0f; /* more bite, fine low end */
     float tilt = (macro-0.5f)*2.0f;                 /* −1..+1 */
     float comp = 0.85f/(0.3f+0.7f*g);               /* level compensation */
     float tc   = 0.18f;                              /* tilt one-pole coeff */
@@ -310,7 +310,7 @@ static void fx_sweeten(slot_dsp_t *s, float *l, float *r, int n,
                        float amount, float macro, float drift){
     float tilt=(macro-0.5f)*2.0f;
     float thr=0.5f, ratio=0.35f+amount*0.4f;         /* gentle comp */
-    float density=amount*1.6f, dwet=clampf(density,0.0f,1.0f);  /* Density sat amount */
+    float density=amount*3.0f, dwet=clampf(density,0.0f,1.0f);  /* Density sat amount */
     float comp=1.0f/(1.0f+density*0.5f);             /* compensate sin-fold gain */
     for(int i=0;i<n;i++){
         float mono=0.5f*(fabsf(l[i])+fabsf(r[i]));
@@ -337,7 +337,7 @@ static void fx_sweeten(slot_dsp_t *s, float *l, float *r, int n,
  * macro=tone/bias, drift=bias instability. */
 static void fx_fuzz(slot_dsp_t *s, float *l, float *r, int n,
                     float amount, float macro, float drift){
-    float g=1.0f+amount*amount*80.0f;
+    float g=1.0f+amount*amount*42.0f;                /* tamed: was *80 (too intense) */
     float bias=(macro-0.5f)*0.7f;                    /* macro shifts symmetry */
     float tonec=0.08f+macro*0.5f;                    /* and post tone */
     for(int i=0;i<n;i++){
@@ -347,7 +347,7 @@ static void fx_fuzz(slot_dsp_t *s, float *l, float *r, int n,
             float y=sb_apply_dist(x,2) - sb_apply_dist(b,2);  /* super-boom Fuzz, DC-removed */
             float *z=ch?&s->z1r:&s->z1l;
             *z += tonec*(y-*z)+DENORM;
-            (ch?r:l)[i]=lerpf((ch?r:l)[i],*z*0.8f,amount); /* amount=0 → dry */
+            (ch?r:l)[i]=lerpf((ch?r:l)[i],*z*0.5f,amount); /* output trim: was 0.8 (too loud) */
         }
     }
 }
