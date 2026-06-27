@@ -131,9 +131,11 @@ typedef struct {
     float  sm1,sm2,sm3,sm4;
     /* LFO phases (0..1) */
     float  lfo,lfo2,lfo3;
-    /* allpass chains: Phaser (≤12 stages, 1 state each) and SHIFT Hilbert
-     * (2 branches × 4 biquad-allpass sections × 4 states) stereo */
+    /* allpass chains: Phaser (≤12 stages, 1 state each) stereo */
     float  ap_l[16], ap_r[16], ap2_l[16], ap2_r[16];
+    /* SHIFT: Warps QuadratureTransform Hilbert — 17 allpass filters × 2 states,
+     * per channel: hil[ch*34 + filt*2 + (0=x,1=y)] */
+    float  hil[68];
     /* misc per-effect scratch */
     float  f1,f2,f3,f4,f5,f6;
     int    i1,i2,i3,i4;
@@ -359,21 +361,29 @@ static void fx_swell(slot_dsp_t *s, float *l, float *r, int n,
     }
 }
 
-/* FOLD — West-Coast wavefolder (Warps bipolar-fold math, analytic). amount=fold
- * depth, macro=symmetry/offset, drift=fold-point wobble. */
+/* Authentic Mutable Warps tables (warps_data.c, MIT) — see SOURCES. */
+extern const float lut_bipolar_fold[];   /* 4096-pt, centred at +2048, range ±0.87 */
+extern const float lut_ap_poles[];       /* 17 Hilbert allpass poles (SHIFT) */
+
+/* FOLD — West-Coast wavefolder using the REAL Warps lut_bipolar_fold curve via
+ * the ALGORITHM_FOLD interpolation. amount=fold drive, macro=offset/symmetry,
+ * drift=fold-point wobble. */
 static void fx_fold(slot_dsp_t *s, float *l, float *r, int n,
                     float amount, float macro, float drift){
-    float depth=0.5f+amount*amount*7.0f;
+    const float kScale=2048.0f/2.295f;               /* Warps: 2048/((2+0.25)*1.02) */
+    float drive=0.5f+amount*amount*4.0f;
     float off=(macro-0.5f)*1.6f;
     for(int i=0;i<n;i++){
         float w=(drift>0.0f? wander(&s->f1,&s->seed,0.0009f)*drift*0.25f:0.0f);
         for(int ch=0;ch<2;ch++){
-            float x=(ch?r:l)[i]*depth + off + w;
-            float y=trifold(x);
-            y=0.5f*y+0.5f*sinf(y*1.5707963f);        /* soften corners */
+            float x=(ch?r:l)[i]*drive + off + w;
+            float idx=x*kScale + 2048.0f;             /* index into lut_bipolar_fold */
+            int i0=(int)idx; if(i0<1)i0=1; else if(i0>4094)i0=4094;
+            float fr=idx-(float)i0; if(fr<0.0f)fr=0.0f; else if(fr>1.0f)fr=1.0f;
+            float y=lut_bipolar_fold[i0]+(lut_bipolar_fold[i0+1]-lut_bipolar_fold[i0])*fr;
             float *z=ch?&s->z1r:&s->z1l;
-            *z += 0.5f*(y-*z)+DENORM;                 /* mild LP */
-            (ch?r:l)[i]=lerpf((ch?r:l)[i],*z*0.85f,clampf(amount*1.3f,0.0f,1.0f));
+            *z += 0.5f*(y-*z)+DENORM;                  /* mild LP smooth */
+            (ch?r:l)[i]=lerpf((ch?r:l)[i],*z*1.1f,clampf(amount*1.3f,0.0f,1.0f));
         }
     }
 }
@@ -485,16 +495,14 @@ static void fx_pitch(slot_dsp_t *s, float *l, float *r, int n,
     }
 }
 
-/* SHIFT — Bode single-sideband frequency shifter (Hilbert via polyphase IIR
- * allpass pair). amount=wet mix, macro=shift Hz (±), drift=shift wander.
- * Niemitalo half-band allpass coefficients; 4 sections per branch. */
-static const float HIL_A[4]={0.6923877778f,0.9360654323f,0.9882295227f,0.9987488453f};
-static const float HIL_B[4]={0.4021921162f,0.8561710882f,0.9722909546f,0.9952884791f};
-static inline float hil_sec(float *st,float x,float k){  /* (k+z^-2)/(1+k z^-2) */
-    /* st[0]=x1 st[1]=x2 st[2]=y1 st[3]=y2 */
-    float y=k*(x - st[3]) + st[1];
-    st[1]=st[0]; st[0]=x; st[3]=st[2]; st[2]=y;
-    return y;
+/* SHIFT — Bode single-sideband frequency shifter using the REAL Mutable Warps
+ * QuadratureTransform: a 17-stage first-order allpass network (lut_ap_poles) that
+ * produces a broadband 90° quadrature pair, multiplied by a complex carrier.
+ * amount=wet mix, macro=shift Hz (±), drift=shift wander.
+ * State per channel: s->hil[ch*34 + filt*2 + {0:x,1:y}] (Warps AllPassFilter). */
+static inline float warps_ap(float *st, float in, float coef){ /* y=coef*(in-y_)+x_ */
+    float y = coef*(in - st[1]) + st[0];
+    st[0]=in; st[1]=y; return y;
 }
 static void fx_shift(slot_dsp_t *s, float *l, float *r, int n,
                      float amount, float macro, float drift){
@@ -504,15 +512,16 @@ static void fx_shift(slot_dsp_t *s, float *l, float *r, int n,
         s->lfo2 += (shift+w)/SR; if(s->lfo2>=1.0f)s->lfo2-=1.0f; if(s->lfo2<0.0f)s->lfo2+=1.0f;
         float cw=cosf(s->lfo2*TWO_PI), sw=sinf(s->lfo2*TWO_PI);
         for(int ch=0;ch<2;ch++){
-            float *A=ch?s->ap2_r:s->ap_l;  /* path A states */
-            float *B=ch?s->ap_r:s->ap2_l;  /* path B states */
+            float *H=&s->hil[ch*34];                  /* 17 filters × 2 states */
             float x=(ch?r:l)[i];
-            float a=x; for(int k=0;k<4;k++) a=hil_sec(&A[k*4],a,HIL_A[k]*HIL_A[k]);
-            float aD=ch?s->f4:s->f3;        /* path A one-sample delay (per ch) */
-            (ch?&s->f4:&s->f3)[0]=a;        /* store z^-1 */
-            float b=x; for(int k=0;k<4;k++) b=hil_sec(&B[k*4],b,HIL_B[k]*HIL_B[k]);
-            float I=aD, Q=b;                /* quadrature pair */
-            float sh=I*cw - Q*sw;
+            float iv=0.0f, qv=0.0f;                   /* i_out / q_out */
+            for(int k=0;k<17;k++){                     /* QuadratureTransform.Process */
+                float coef=-lut_ap_poles[k];
+                float *dst=(k&1)?&qv:&iv;
+                float src=(k<=1)?x:*dst;               /* first two read input, then cascade */
+                *dst=warps_ap(&H[k*2], src, coef);
+            }
+            float sh=iv*cw - qv*sw;                    /* single-sideband shift */
             (ch?r:l)[i]=lerpf(x,sh,amount);
         }
     }
