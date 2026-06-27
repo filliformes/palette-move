@@ -1112,6 +1112,7 @@ static void *create_instance(const char *module_dir, const char *json){
     p->current_preset = 1;
     p->current_level = 1;                       /* LV_PALETTE — landing mirrors Console knobs */
     p->rng = 0x12345678u;
+    load_preset(p, 1);                          /* start on Init (Drive→Doubler→Cascade→Filter) */
     if(g_host && g_host->log) g_host->log("[palette] instance created");
     return p;
 }
