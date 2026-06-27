@@ -1297,8 +1297,13 @@ static int get_param(void *instance, const char *key, char *buf, int buf_len){
         }
         o+=snprintf(buf+o,buf_len-o,
           "{\"key\":\"input_vol\",\"name\":\"Input Vol\",\"type\":\"float\",\"min\":0,\"max\":2,\"step\":0.01},"
-          "{\"key\":\"mix\",\"name\":\"Mix\",\"type\":\"float\",\"min\":0,\"max\":1,\"step\":0.01},"
-          "{\"key\":\"current_preset\",\"name\":\"Preset\",\"type\":\"int\",\"min\":1,\"max\":50,\"step\":1},"
+          "{\"key\":\"mix\",\"name\":\"Mix\",\"type\":\"float\",\"min\":0,\"max\":1,\"step\":0.01},");
+        /* Preset — named enum ("N Name"); set_param uses atoi() to load by number */
+        o+=snprintf(buf+o,buf_len-o,"{\"key\":\"current_preset\",\"name\":\"Preset\",\"type\":\"enum\",\"options\":[");
+        for(int i=0;i<NUM_PRESETS;i++)
+            o+=snprintf(buf+o,buf_len-o,"%s\"%d %s\"",i?",":"",i+1,PRESETS[i].name);
+        o+=snprintf(buf+o,buf_len-o,"]},");
+        o+=snprintf(buf+o,buf_len-o,
           "{\"key\":\"rnd_patch\",\"name\":\"Rnd Patch\",\"type\":\"enum\",\"options\":[\"0\",\"1\"]},"
           "{\"key\":\"rnd_effect\",\"name\":\"Rnd FX\",\"type\":\"enum\",\"options\":[\"0\",\"1\"]},"
           "{\"key\":\"rnd_amount\",\"name\":\"Rnd Amt\",\"type\":\"enum\",\"options\":[\"0\",\"1\"]},"
@@ -1323,7 +1328,8 @@ static int get_param(void *instance, const char *key, char *buf, int buf_len){
     }
     if(!strcmp(key,"mix"))           return snprintf(buf,buf_len,"%.2f",p->mix);
     if(!strcmp(key,"input_vol"))     return snprintf(buf,buf_len,"%.2f",p->input_vol);
-    if(!strcmp(key,"current_preset"))return snprintf(buf,buf_len,"%d",p->current_preset);
+    if(!strcmp(key,"current_preset")){ int pi=clampi(p->current_preset-1,0,NUM_PRESETS-1);
+        return snprintf(buf,buf_len,"%d %s",pi+1,PRESETS[pi].name); }
     if(!strcmp(key,"fx_reorder")){ char lb[16]; perm_label(p->fx_reorder,lb,sizeof lb);
                                    return snprintf(buf,buf_len,"%s",lb); }
     if(!strncmp(key,"rnd_",4))       return snprintf(buf,buf_len,"0");   /* triggers read 0 */
@@ -1352,7 +1358,8 @@ static int get_param(void *instance, const char *key, char *buf, int buf_len){
         } else { /* _value */
             if(slot_of(pk)>=0 && !strcmp(pk+4,"select"))
                 return snprintf(buf,buf_len,"%s",FX_NAMES[clampi(p->slots[slot_of(pk)].select,0,NUM_FX)]);
-            if(!strcmp(pk,"current_preset")) return snprintf(buf,buf_len,"%d",p->current_preset);
+            if(!strcmp(pk,"current_preset")){ int pi=clampi(p->current_preset-1,0,NUM_PRESETS-1);
+                return snprintf(buf,buf_len,"%d %s",pi+1,PRESETS[pi].name); }
             if(!strncmp(pk,"rnd_",4))        return snprintf(buf,buf_len,"tap");
             return snprintf(buf,buf_len,"%d%%",(int)(get_float_key(p,pk)*100));
         }
