@@ -104,31 +104,56 @@ static const uint8_t FX_GROUP[PFX_COUNT] = {
     0, 0,0,0,0,0,0, 1,1,1,1,1,1, 2,2,2,2,2,2, 3,3,3,3,3,3
 };
 
-/* ── Per-slot DSP scratch (shared across effects; each effect uses a subset) ──
- * Allocated once in create_instance, never in process_block. Effect impls add
- * fields here as needed and clear them in slot_reset(). */
+/* ── Clouds C++ effects (fx_clouds.cc) — SPACE / BLOOM / FREEZE ───────────────
+ * Fully isolated behind 3 opaque calls; palette.c never sees Clouds internals.
+ * alloc returns heavy state (or NULL on OOM), freed on switch/destroy. */
+extern void *pfx_clouds_alloc(int fx_id, float sr);
+extern void  pfx_clouds_free(void *heavy);
+extern void  pfx_clouds_process(int fx_id, void *heavy, float *l, float *r, int n,
+                                float amount, float macro, float drift);
+
+/* ── Per-slot DSP scratch (shared across the C effects; each uses a subset) ───
+ * Allocated once in create_instance, never in process_block. Generous so every
+ * C effect finds the state it needs; cleared in slot_reset() on effect switch. */
 typedef struct {
-    /* delay-class effects (Cascade/Reels/Collage/Reverse/Doubler/Space-ish) */
+    /* delay line (Cascade/Reels/Reverse/Collage/Doubler/Vibrato/Pitch/Broken) */
     float *dl_l, *dl_r;       /* MAX_DELAY each */
     int    wp;                /* write pointer */
-    /* modulation / filters */
-    float  lfo;               /* 0..1 phase */
-    float  z1l, z1r, z2l, z2r;/* generic one-pole / biquad state */
-    float  env;               /* envelope follower (Swell/Squash) */
-    uint32_t seed;            /* per-slot deterministic RNG for drift */
-    /* TODO: BLOOM/FREEZE spectral + grain state, etc. */
+    /* generic one-pole / cascaded filter states (stereo) */
+    float  z1l,z1r, z2l,z2r, z3l,z3r, z4l,z4r;
+    /* state-variable filter (Filter / Howl) stereo: lp & bp integrators */
+    float  lp_l,bp_l, lp_r,bp_r;
+    /* biquad (peaking/shelf) stereo, direct-form I */
+    float  bx1l,bx2l,by1l,by2l, bx1r,bx2r,by1r,by2r;
+    /* envelope followers */
+    float  env, env2;
+    /* parameter smoothing companions */
+    float  sm1,sm2,sm3,sm4;
+    /* LFO phases (0..1) */
+    float  lfo,lfo2,lfo3;
+    /* allpass chains: Phaser (≤12 stages, 1 state each) and SHIFT Hilbert
+     * (2 branches × 4 biquad-allpass sections × 4 states) stereo */
+    float  ap_l[16], ap_r[16], ap2_l[16], ap2_r[16];
+    /* misc per-effect scratch */
+    float  f1,f2,f3,f4,f5,f6;
+    int    i1,i2,i3,i4;
+    uint32_t seed;            /* per-slot deterministic RNG (drift) */
+    /* heavy C++ (Clouds) effect state — lazily alloc'd on select change */
+    void  *heavy;
+    int    heavy_kind;        /* PFX_* id the heavy ptr currently serves (0 = none) */
 } slot_dsp_t;
 
 typedef struct {
     int   select;             /* PFX_* id (0 = Off) */
     int   prev_select;        /* for Skip-walk direction inference */
     float amount, macro, drift;
+    float ramp;               /* 0..1 click-free fade-in after an effect switch */
     slot_dsp_t dsp;
 } slot_t;
 
 /* ── Effect process signature ────────────────────────────────────────────────
  * Stereo, n frames, in-place on l[]/r[] (float, ±1). amount/macro/drift ∈ [0,1].
- * OFF is handled by the host (never dispatched). */
+ * OFF and Clouds effects are dispatched specially by the host (never here). */
 typedef void (*fx_process_fn)(slot_dsp_t*, float*, float*, int,
                               float amount, float macro, float drift);
 typedef void (*fx_reset_fn)(slot_dsp_t*);
@@ -137,6 +162,11 @@ typedef struct {
     fx_process_fn process;
     fx_reset_fn   reset;      /* may be NULL */
 } palette_effect_t;
+
+/* heavy (Clouds-backed) effects need lazy alloc + special dispatch */
+static inline int is_clouds_fx(int id){
+    return id==PFX_SPACE || id==PFX_BLOOM || id==PFX_FREEZE;
+}
 
 /* ── Instance ────────────────────────────────────────────────────────────────── */
 typedef struct {
@@ -165,103 +195,538 @@ static void perm_label(int idx, char *buf, int n){
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
- *  EFFECT IMPLEMENTATIONS
- *  Stubs pass through. Three are worked examples (DRIVE, TREMOLO, FILTER).
- *  Fill the rest from design-spec §3 (sibling-first: Mello/KrautDrums/Verglas/
- *  Super Boum), keeping each lean. amount/macro/drift are the slot's 3 knobs.
+ *  EFFECT IMPLEMENTATIONS  (21 pure-C effects; SPACE/BLOOM/FREEZE are in
+ *  fx_clouds.cc). Signature: in-place stereo float ±1, n frames.
+ *    amount = primary knob   macro = secondary (Chroma Tilt/Rate/Time role)
+ *    drift  = instability macro — "musical wander", tasteful at every position.
+ *  Sibling-sourced voicings (super-boom / mello / krautdrums) re-voiced inline.
  * ═══════════════════════════════════════════════════════════════════════════ */
+
+#ifndef TWO_PI
+#define TWO_PI 6.28318530718f
+#endif
+#define DENORM 1e-20f
+static inline float lerpf(float a,float b,float t){ return a+(b-a)*t; }
+/* fractional delay read, `d` samples behind the next write index `wp` */
+static inline float dlr(const float *b,int wp,float d){
+    float rp=(float)wp-d;
+    while(rp<0.0f) rp+=(float)MAX_DELAY;
+    while(rp>=(float)MAX_DELAY) rp-=(float)MAX_DELAY;
+    int i0=(int)rp; float fr=rp-(float)i0; int i1=i0+1; if(i1>=MAX_DELAY) i1=0;
+    return b[i0]+(b[i1]-b[i0])*fr;
+}
+/* triangle wavefolder: reflect x into [-1,1] (period 4) */
+static inline float trifold(float x){
+    x = x - 4.0f*floorf((x+2.0f)*0.25f);          /* wrap to [-2,2) */
+    if(x>1.0f) x=2.0f-x; else if(x<-1.0f) x=-2.0f-x;
+    return x;
+}
+/* slow musical random-walk in [-1,1] stored in *st (drift LFO) */
+static inline float wander(float *st,uint32_t *seed,float speed){
+    *st += speed*((frand(seed)-0.5f)*2.0f - *st);
+    return *st;
+}
 
 static void fx_passthrough(slot_dsp_t *s, float *l, float *r, int n,
                            float amount, float macro, float drift){
-    (void)s;(void)l;(void)r;(void)n;(void)amount;(void)macro;(void)drift; /* TODO */
+    (void)s;(void)l;(void)r;(void)n;(void)amount;(void)macro;(void)drift;
 }
 
-/* DRIVE — tube-ish overdrive. amount=intensity, macro=tone (tilt), drift=bias wander.
- * (Placeholder voicing; replace with super-boom-move apply_dist Tube + sb_tanh.) */
+/* ── CHARACTER ─────────────────────────────────────────────────────────────── */
+
+/* DRIVE — tube-ish overdrive (super-boom sb_tanh/Tube voicing). amount=drive,
+ * macro=tone tilt (dark↔bright), drift=slow bias wander. */
 static void fx_drive(slot_dsp_t *s, float *l, float *r, int n,
                      float amount, float macro, float drift){
-    float g    = 1.0f + amount*8.0f;
-    float tilt = (macro - 0.5f)*2.0f;            /* −1..+1 */
+    float g    = 1.0f + amount*amount*23.0f;        /* quadratic: fine low end */
+    float tilt = (macro-0.5f)*2.0f;                 /* −1..+1 */
+    float comp = 0.85f/(0.3f+0.7f*g);               /* level compensation */
+    float tc   = 0.18f;                              /* tilt one-pole coeff */
     for(int i=0;i<n;i++){
-        float bias = drift>0 ? (frand(&s->seed)-0.5f)*drift*0.1f : 0.0f;
-        float xl = tanhf(l[i]*g + bias), xr = tanhf(r[i]*g + bias);
-        /* simple tilt: blend toward a one-pole LP/HP using z1 as LP state */
-        s->z1l += 0.2f*(xl - s->z1l); s->z1r += 0.2f*(xr - s->z1r);
-        l[i] = (tilt>=0) ? xl*(1.0f-tilt)+ (xl-s->z1l)*tilt    /* bright */
-                         : xl*(1.0f+tilt) - s->z1l*tilt;       /* dark   */
-        r[i] = (tilt>=0) ? xr*(1.0f-tilt)+ (xr-s->z1r)*tilt
-                         : xr*(1.0f+tilt) - s->z1r*tilt;
-        l[i]*=0.7f; r[i]*=0.7f;                   /* level comp */
+        float bias = drift>0.0f ? wander(&s->f1,&s->seed,0.0006f)*drift*0.12f : 0.0f;
+        float xl=tanhf(l[i]*g+bias), xr=tanhf(r[i]*g+bias);
+        s->z1l += tc*(xl-s->z1l)+DENORM; s->z1r += tc*(xr-s->z1r)+DENORM;
+        float ll = (tilt>=0.0f)? lerpf(xl,(xl-s->z1l)*2.0f,tilt) : lerpf(xl,s->z1l*1.6f,-tilt);
+        float rr = (tilt>=0.0f)? lerpf(xr,(xr-s->z1r)*2.0f,tilt) : lerpf(xr,s->z1r*1.6f,-tilt);
+        l[i]=ll*comp; r[i]=rr*comp;
     }
 }
 
-/* TREMOLO — amp mod. amount=depth, macro=rate, drift=instability. */
+/* SWEETEN — console preamp: low-shelf warmth + gentle comp + light sat.
+ * amount=comp/sat, macro=tone (tilt), drift=subtle level drift. */
+static void fx_sweeten(slot_dsp_t *s, float *l, float *r, int n,
+                       float amount, float macro, float drift){
+    float tilt=(macro-0.5f)*2.0f;
+    float thr=0.5f, ratio=0.35f+amount*0.4f;        /* gentle */
+    float sat=0.3f+amount*0.9f;
+    for(int i=0;i<n;i++){
+        float mono=0.5f*(fabsf(l[i])+fabsf(r[i]));
+        s->env += (mono>s->env?0.02f:0.004f)*(mono-s->env)+DENORM;  /* fast atk slow rel */
+        float gr=1.0f; if(s->env>thr) gr=1.0f-(1.0f-thr/s->env)*ratio;
+        float dl=(drift>0.0f)? 1.0f+wander(&s->f1,&s->seed,0.0004f)*drift*0.03f : 1.0f;
+        for(int ch=0;ch<2;ch++){
+            float x=(ch?r:l)[i]*gr*dl;
+            float *z=ch?&s->z1r:&s->z1l;
+            *z += 0.10f*(x-*z)+DENORM;               /* LP for tilt */
+            float t=(tilt>=0.0f)? lerpf(x,(x-*z)*1.8f,tilt) : lerpf(x,*z*1.5f,-tilt);
+            (ch?r:l)[i]=tanhf(t*sat)/ (0.6f+0.4f*sat);
+        }
+    }
+}
+
+/* FUZZ — high-gain asymmetric clip with bias/gate. amount=intensity,
+ * macro=tone/bias, drift=bias instability. */
+static void fx_fuzz(slot_dsp_t *s, float *l, float *r, int n,
+                    float amount, float macro, float drift){
+    float g=1.0f+amount*amount*80.0f;
+    float bias=(macro-0.5f)*0.7f;                    /* macro shifts symmetry */
+    float tonec=0.08f+macro*0.5f;                    /* and post tone */
+    for(int i=0;i<n;i++){
+        float b=bias + (drift>0.0f? wander(&s->f1,&s->seed,0.002f)*drift*0.4f:0.0f);
+        for(int ch=0;ch<2;ch++){
+            float x=(ch?r:l)[i]*g + b;
+            float y=x/(1.0f+fabsf(x));               /* asym soft clip */
+            y=tanhf(y*1.6f)-tanhf(b);                /* remove DC from bias */
+            float *z=ch?&s->z1r:&s->z1l;
+            *z += tonec*(y-*z)+DENORM;
+            (ch?r:l)[i]=*z*0.7f;
+        }
+    }
+}
+
+/* HOWL — resonant filter-fuzz / synth stab. amount=intensity (drive+res),
+ * macro=resonant frequency, drift=res-freq wander. SVF bandpass self-osc. */
+static void fx_howl(slot_dsp_t *s, float *l, float *r, int n,
+                    float amount, float macro, float drift){
+    float base=120.0f*powf(40.0f,macro);             /* 120..4800 Hz */
+    float q=0.5f+amount*0.45f;                        /* toward self-osc */
+    float drive=1.0f+amount*amount*12.0f;
+    for(int i=0;i<n;i++){
+        float fz=base*(drift>0.0f?(1.0f+wander(&s->f1,&s->seed,0.0008f)*drift*0.5f):1.0f);
+        float f=2.0f*sinf(3.14159265f*clampf(fz,40.0f,9000.0f)/SR);
+        float fb=1.0f-q;
+        for(int ch=0;ch<2;ch++){
+            float *lp=ch?&s->lp_r:&s->lp_l; float *bp=ch?&s->bp_r:&s->bp_l;
+            float x=tanhf((ch?r:l)[i]*drive);
+            *lp += f*(*bp)+DENORM;
+            float hp=x-*lp-fb*(*bp);
+            *bp += f*hp+DENORM;
+            (ch?r:l)[i]=tanhf((*bp)*(0.8f+amount))*0.9f;   /* bandpass voiced */
+        }
+    }
+}
+
+/* SWELL — auto volume-swell (slow-gear). amount=swell time, macro=sensitivity,
+ * drift=threshold jitter. Suppresses attacks, fades volume in. */
+static void fx_swell(slot_dsp_t *s, float *l, float *r, int n,
+                     float amount, float macro, float drift){
+    float atk=0.0008f/(1.0f+amount*amount*40.0f);    /* longer swell = slower rise */
+    float rel=0.004f;
+    float sens=0.02f+(1.0f-macro)*0.2f;
+    for(int i=0;i<n;i++){
+        float mono=0.5f*(fabsf(l[i])+fabsf(r[i]));
+        s->env += (mono>s->env?0.05f:0.001f)*(mono-s->env)+DENORM;  /* input env */
+        float th=sens*(drift>0.0f?(1.0f+wander(&s->f1,&s->seed,0.003f)*drift*0.6f):1.0f);
+        float tgt=(s->env>th)?1.0f:0.0f;                 /* gate the swell target */
+        s->sm1 += (tgt>s->sm1?atk:rel)*(tgt-s->sm1)+DENORM; /* swell gain */
+        l[i]*=s->sm1; r[i]*=s->sm1;
+    }
+}
+
+/* FOLD — West-Coast wavefolder (Warps bipolar-fold math, analytic). amount=fold
+ * depth, macro=symmetry/offset, drift=fold-point wobble. */
+static void fx_fold(slot_dsp_t *s, float *l, float *r, int n,
+                    float amount, float macro, float drift){
+    float depth=0.5f+amount*amount*7.0f;
+    float off=(macro-0.5f)*1.6f;
+    for(int i=0;i<n;i++){
+        float w=(drift>0.0f? wander(&s->f1,&s->seed,0.0009f)*drift*0.25f:0.0f);
+        for(int ch=0;ch<2;ch++){
+            float x=(ch?r:l)[i]*depth + off + w;
+            float y=trifold(x);
+            y=0.5f*y+0.5f*sinf(y*1.5707963f);        /* soften corners */
+            float *z=ch?&s->z1r:&s->z1l;
+            *z += 0.5f*(y-*z)+DENORM;                 /* mild LP */
+            (ch?r:l)[i]=lerpf((ch?r:l)[i],*z*0.85f,clampf(amount*1.3f,0.0f,1.0f));
+        }
+    }
+}
+
+/* ── MOVEMENT ──────────────────────────────────────────────────────────────── */
+
+/* DOUBLER — ADT stereo double-track / slapback. amount=mix, macro=time,
+ * drift=random momentary detune. */
+static void fx_doubler(slot_dsp_t *s, float *l, float *r, int n,
+                       float amount, float macro, float drift){
+    float baseL=SR*(0.012f+macro*0.045f);            /* 12..57 ms */
+    float baseR=baseL*1.28f;
+    for(int i=0;i<n;i++){
+        s->lfo+=0.6f/SR; if(s->lfo>=1.0f)s->lfo-=1.0f;
+        s->lfo2+=0.43f/SR; if(s->lfo2>=1.0f)s->lfo2-=1.0f;
+        float wob=(drift>0.0f? wander(&s->f1,&s->seed,0.004f)*drift:0.0f);
+        float dL=baseL*(1.0f+0.004f*sinf(s->lfo*TWO_PI)+0.01f*wob);
+        float dR=baseR*(1.0f+0.004f*sinf(s->lfo2*TWO_PI)-0.01f*wob);
+        s->dl_l[s->wp]=l[i]; s->dl_r[s->wp]=r[i];
+        float eL=dlr(s->dl_l,s->wp,dL), eR=dlr(s->dl_r,s->wp,dR);
+        s->wp=(s->wp+1)%MAX_DELAY;
+        l[i]=lerpf(l[i],l[i]*0.7f+eL,amount);
+        r[i]=lerpf(r[i],r[i]*0.7f+eR,amount);
+    }
+}
+
+/* VIBRATO — modulated delay (no dry). amount=depth, macro=rate,
+ * drift=sine→random waveshape. */
+static void fx_vibrato(slot_dsp_t *s, float *l, float *r, int n,
+                       float amount, float macro, float drift){
+    float rate=0.5f+macro*7.5f;                      /* 0.5..8 Hz */
+    float depth=SR*0.0005f*(0.3f+amount*4.0f);       /* mod depth in samples */
+    float base=SR*0.006f;
+    for(int i=0;i<n;i++){
+        s->lfo+=rate/SR; if(s->lfo>=1.0f)s->lfo-=1.0f;
+        float sine=sinf(s->lfo*TWO_PI);
+        float rnd=(drift>0.0f? wander(&s->f1,&s->seed,0.02f):0.0f);
+        float mod=lerpf(sine,rnd,clampf(drift,0.0f,0.9f));
+        float d=base+depth*(1.0f+mod);
+        s->dl_l[s->wp]=l[i]; s->dl_r[s->wp]=r[i];
+        l[i]=dlr(s->dl_l,s->wp,d); r[i]=dlr(s->dl_r,s->wp,d);
+        s->wp=(s->wp+1)%MAX_DELAY;
+    }
+}
+
+/* PHASER — N-stage allpass cascade + feedback. amount=intensity/stages,
+ * macro=rate, drift=waveform randomness. */
+static void fx_phaser(slot_dsp_t *s, float *l, float *r, int n,
+                      float amount, float macro, float drift){
+    int stages=2+(int)(amount*10.0f); if(stages>12)stages=12;  /* 2..12 */
+    float rate=0.05f+macro*macro*4.0f;
+    float fb=amount*0.6f;
+    for(int i=0;i<n;i++){
+        s->lfo+=rate/SR; if(s->lfo>=1.0f)s->lfo-=1.0f;
+        float rnd=(drift>0.0f? wander(&s->f2,&s->seed,0.01f)*drift*0.4f:0.0f);
+        float sweep=0.5f+0.5f*sinf(s->lfo*TWO_PI)+rnd;
+        float coef=0.05f+0.9f*clampf(sweep,0.0f,1.0f); /* allpass coefficient */
+        for(int ch=0;ch<2;ch++){
+            float *ap=ch?s->ap_r:s->ap_l; float *fbz=ch?&s->z2r:&s->z2l;
+            float x=(ch?r:l)[i]+ *fbz*fb;
+            for(int k=0;k<stages;k++){
+                float y=coef*x+ap[k];                 /* 1st-order allpass */
+                ap[k]=x-coef*y; x=y;
+            }
+            *fbz=x;
+            (ch?r:l)[i]=lerpf((ch?r:l)[i],0.5f*((ch?r:l)[i]+x),clampf(0.3f+amount,0.0f,1.0f));
+        }
+    }
+}
+
+/* TREMOLO — amp mod, sine→square morph. amount=depth, macro=rate,
+ * drift=amp/freq variation. */
 static void fx_tremolo(slot_dsp_t *s, float *l, float *r, int n,
                        float amount, float macro, float drift){
-    float rate = 0.5f + macro*11.5f;             /* 0.5..12 Hz */
-    float inc  = rate / SR;
+    float rate=0.5f+macro*11.5f;                     /* 0.5..12 Hz */
+    float shape=clampf(amount,0.0f,1.0f);            /* deeper = squarer */
     for(int i=0;i<n;i++){
-        s->lfo += inc; if(s->lfo>=1.0f) s->lfo-=1.0f;
-        float tri = 2.0f*fabsf(2.0f*s->lfo-1.0f)-1.0f;          /* −1..1 */
-        if(drift>0){ s->z1l += 0.001f*((frand(&s->seed)-0.5f) - s->z1l);
-                     tri += s->z1l*drift*2.0f; tri=clampf(tri,-1,1); }
-        float g = 1.0f - amount*(0.5f*(1.0f+tri));  /* depth */
+        float fr=rate*(drift>0.0f?(1.0f+wander(&s->f2,&s->seed,0.002f)*drift*0.15f):1.0f);
+        s->lfo+=fr/SR; if(s->lfo>=1.0f)s->lfo-=1.0f;
+        float sine=sinf(s->lfo*TWO_PI);
+        float sq=tanhf(sine*4.0f);                    /* soft square */
+        float w=lerpf(sine,sq,shape);
+        float amp=(drift>0.0f? wander(&s->f1,&s->seed,0.002f)*drift*0.1f:0.0f);
+        float g=1.0f-amount*(0.5f*(1.0f+w)) + amp;
+        g=clampf(g,0.0f,1.2f);
         l[i]*=g; r[i]*=g;
     }
 }
 
-/* FILTER — tilt/LP/HP one-pole. amount=cutoff, macro=mode+res, drift=cutoff wander.
- * (Skeleton: LP only; add tilt/HP modes + resonance from Mello/Verglas SVF.) */
-static void fx_filter(slot_dsp_t *s, float *l, float *r, int n,
-                      float amount, float macro, float drift){
-    (void)macro;
-    float cutoff = 60.0f * powf(300.0f, amount);     /* 60..18k Hz exp */
-    if(drift>0){ cutoff *= 1.0f + (frand(&s->seed)-0.5f)*drift; }
-    float c = 1.0f - expf(-6.2831853f*clampf(cutoff,20,20000)/SR);
+/* PITCH — delay-line pitch shifter ±1 oct + lo-fi grit. amount=wet mix,
+ * macro=pitch, drift=resolution drop. Dual-tap crossfade window. */
+static void fx_pitch(slot_dsp_t *s, float *l, float *r, int n,
+                     float amount, float macro, float drift){
+    float ratio=powf(2.0f,(macro-0.5f)*2.0f);        /* 0.5 .. 2.0 */
+    float win=SR*0.040f;                              /* 40 ms window */
+    float drate=(1.0f-ratio);                         /* read-ptr drift / sample */
+    int crush=(drift>0.0f)?(int)(1.0f+drift*drift*14.0f):0;
     for(int i=0;i<n;i++){
-        s->z1l += c*(l[i]-s->z1l); s->z1r += c*(r[i]-s->z1r);
-        l[i]=s->z1l; r[i]=s->z1r;
+        s->dl_l[s->wp]=l[i]; s->dl_r[s->wp]=r[i];
+        s->f1+=drate; if(s->f1<0)s->f1+=win; if(s->f1>=win)s->f1-=win;
+        float p2=s->f1+win*0.5f; if(p2>=win)p2-=win;
+        float w1=0.5f-0.5f*cosf(TWO_PI*s->f1/win);    /* triangular/raised-cos xfade */
+        float w2=1.0f-w1;
+        float oL=dlr(s->dl_l,s->wp,win-s->f1)*w1 + dlr(s->dl_l,s->wp,win-p2)*w2;
+        float oR=dlr(s->dl_r,s->wp,win-s->f1)*w1 + dlr(s->dl_r,s->wp,win-p2)*w2;
+        s->wp=(s->wp+1)%MAX_DELAY;
+        if(crush>0){ float q=(float)crush*4.0f; oL=floorf(oL*q)/q; oR=floorf(oR*q)/q; }
+        l[i]=lerpf(l[i],oL,amount); r[i]=lerpf(r[i],oR,amount);
     }
 }
 
-/* NOTE: fx_filter references a placeholder rng — effects that need randomness
- * should carry their own seed in slot_dsp_t. Left intentionally as a TODO marker
- * so each effect owns deterministic, click-free drift. */
+/* SHIFT — Bode single-sideband frequency shifter (Hilbert via polyphase IIR
+ * allpass pair). amount=wet mix, macro=shift Hz (±), drift=shift wander.
+ * Niemitalo half-band allpass coefficients; 4 sections per branch. */
+static const float HIL_A[4]={0.6923877778f,0.9360654323f,0.9882295227f,0.9987488453f};
+static const float HIL_B[4]={0.4021921162f,0.8561710882f,0.9722909546f,0.9952884791f};
+static inline float hil_sec(float *st,float x,float k){  /* (k+z^-2)/(1+k z^-2) */
+    /* st[0]=x1 st[1]=x2 st[2]=y1 st[3]=y2 */
+    float y=k*(x - st[3]) + st[1];
+    st[1]=st[0]; st[0]=x; st[3]=st[2]; st[2]=y;
+    return y;
+}
+static void fx_shift(slot_dsp_t *s, float *l, float *r, int n,
+                     float amount, float macro, float drift){
+    float shift=(macro-0.5f)*1000.0f;                /* −500..+500 Hz */
+    for(int i=0;i<n;i++){
+        float w=(drift>0.0f? wander(&s->f1,&s->seed,0.0006f)*drift*40.0f:0.0f);
+        s->lfo2 += (shift+w)/SR; if(s->lfo2>=1.0f)s->lfo2-=1.0f; if(s->lfo2<0.0f)s->lfo2+=1.0f;
+        float cw=cosf(s->lfo2*TWO_PI), sw=sinf(s->lfo2*TWO_PI);
+        for(int ch=0;ch<2;ch++){
+            float *A=ch?s->ap2_r:s->ap_l;  /* path A states */
+            float *B=ch?s->ap_r:s->ap2_l;  /* path B states */
+            float x=(ch?r:l)[i];
+            float a=x; for(int k=0;k<4;k++) a=hil_sec(&A[k*4],a,HIL_A[k]*HIL_A[k]);
+            float aD=ch?s->f4:s->f3;        /* path A one-sample delay (per ch) */
+            (ch?&s->f4:&s->f3)[0]=a;        /* store z^-1 */
+            float b=x; for(int k=0;k<4;k++) b=hil_sec(&B[k*4],b,HIL_B[k]*HIL_B[k]);
+            float I=aD, Q=b;                /* quadrature pair */
+            float sh=I*cw - Q*sw;
+            (ch?r:l)[i]=lerpf(x,sh,amount);
+        }
+    }
+}
+
+/* ── DIFFUSION ─────────────────────────────────────────────────────────────── */
+
+/* delay-core helper: BBD/tape echo. self_osc selects fb cap (0.95 vs 1.05). */
+static void delay_core(slot_dsp_t *s, float *l, float *r, int n,
+                       float amount, float macro, float drift,
+                       float fb_cap, float lp_amt, float wow_hz, float wow_depth){
+    float t=SR*(0.03f*powf(40.0f,macro));            /* 30 ms .. 1.2 s exp */
+    float fb=amount*fb_cap;
+    for(int i=0;i<n;i++){
+        s->lfo+=wow_hz/SR; if(s->lfo>=1.0f)s->lfo-=1.0f;
+        float wob=wow_depth*sinf(s->lfo*TWO_PI)
+                 + (drift>0.0f? wander(&s->f1,&s->seed,0.001f)*drift*wow_depth*3.0f:0.0f);
+        float d=t*(1.0f+wob);
+        float tapL=dlr(s->dl_l,s->wp,d), tapR=dlr(s->dl_r,s->wp,d);
+        /* 2-pole LP darkening in the feedback */
+        s->z1l+=lp_amt*(tapL-s->z1l)+DENORM; s->z2l+=lp_amt*(s->z1l-s->z2l)+DENORM;
+        s->z1r+=lp_amt*(tapR-s->z1r)+DENORM; s->z2r+=lp_amt*(s->z1r-s->z2r)+DENORM;
+        float fl=s->z2l*fb, fr=s->z2r*fb;
+        fl=fl/(1.0f+fabsf(fl*0.7f)); fr=fr/(1.0f+fabsf(fr*0.7f)); /* soft sat */
+        s->dl_l[s->wp]=l[i]+fl; s->dl_r[s->wp]=r[i]+fr;
+        s->wp=(s->wp+1)%MAX_DELAY;
+        l[i]=l[i]+tapL*0.9f; r[i]=r[i]+tapR*0.9f;
+    }
+}
+/* CASCADE — BBD analog delay, dark, can self-oscillate. */
+static void fx_cascade(slot_dsp_t *s, float *l, float *r, int n,
+                       float amount, float macro, float drift){
+    delay_core(s,l,r,n,amount,macro,drift,0.95f,0.28f,0.15f,0.0008f);
+}
+/* REELS — worn tape echo (RE-201): higher fb cap (self-osc), more wow. */
+static void fx_reels(slot_dsp_t *s, float *l, float *r, int n,
+                     float amount, float macro, float drift){
+    delay_core(s,l,r,n,amount,macro,drift,1.05f,0.34f,0.7f,0.0016f);
+}
+
+/* REVERSE — reverse delay. amount=wet mix, macro=segment time, drift=pitch mod.
+ * Records forward; plays windowed segments backward. */
+static void fx_reverse(slot_dsp_t *s, float *l, float *r, int n,
+                       float amount, float macro, float drift){
+    float seg=SR*(0.08f+macro*0.6f);                 /* 80..680 ms segment */
+    float spd=1.0f+(drift>0.0f? wander(&s->f1,&s->seed,0.0008f)*drift*0.05f:0.0f);
+    for(int i=0;i<n;i++){
+        s->dl_l[s->wp]=l[i]; s->dl_r[s->wp]=r[i];
+        s->f2-=spd; if(s->f2<=0.0f) s->f2+=seg;       /* reverse read offset grows */
+        float d=s->f2;                                 /* read this far behind */
+        float env=0.5f-0.5f*cosf(TWO_PI*(seg-s->f2)/seg);  /* window the segment */
+        float oL=dlr(s->dl_l,s->wp,d)*env, oR=dlr(s->dl_r,s->wp,d)*env;
+        s->wp=(s->wp+1)%MAX_DELAY;
+        l[i]=lerpf(l[i],oL,amount); r[i]=lerpf(r[i],oR,amount);
+    }
+}
+
+/* COLLAGE — glitch/granular looping delay. amount=feedback, macro=loop time,
+ * drift=random double-speed/reverse grains. */
+static void fx_collage(slot_dsp_t *s, float *l, float *r, int n,
+                       float amount, float macro, float drift){
+    float loop=SR*(0.05f+macro*1.2f);
+    float fb=amount*0.9f;
+    for(int i=0;i<n;i++){
+        /* grain scheduler: f3=grain pos, f4=grain speed, i1=samples left */
+        if(s->i1<=0){
+            s->i1=(int)(SR*(0.04f+frand(&s->seed)*0.12f));
+            s->f4=1.0f;
+            if(drift>0.0f && frand(&s->seed)<drift*0.5f) s->f4=(frand(&s->seed)<0.5f?2.0f:-1.0f);
+            s->f3=frand(&s->seed)*loop;
+        }
+        s->i1--;
+        s->f3+=s->f4; if(s->f3<0)s->f3+=loop; if(s->f3>=loop)s->f3-=loop;
+        float gL=dlr(s->dl_l,s->wp,loop-s->f3), gR=dlr(s->dl_r,s->wp,loop-s->f3);
+        s->dl_l[s->wp]=l[i]+gL*fb; s->dl_r[s->wp]=r[i]+gR*fb;
+        s->wp=(s->wp+1)%MAX_DELAY;
+        l[i]=lerpf(l[i],gL,amount*0.9f); r[i]=lerpf(r[i],gR,amount*0.9f);
+    }
+}
+
+/* ── TEXTURE ───────────────────────────────────────────────────────────────── */
+
+/* FILTER — multimode Tilt/LP/HP (SVF) with resonance. amount=cutoff,
+ * macro=mode (0 LP · 0.5 tilt · 1 HP), drift=cutoff wander. */
+static void fx_filter(slot_dsp_t *s, float *l, float *r, int n,
+                      float amount, float macro, float drift){
+    float cutoff=60.0f*powf(280.0f,amount);          /* 60..16.8k Hz */
+    float lpw=clampf(1.0f-macro*2.0f,0.0f,1.0f);     /* 0..0.5 → LP */
+    float hpw=clampf(macro*2.0f-1.0f,0.0f,1.0f);     /* 0.5..1 → HP */
+    float bpw=1.0f-lpw-hpw;                            /* center → flat/tilt */
+    float q=0.4f;
+    for(int i=0;i<n;i++){
+        float fz=cutoff*(drift>0.0f?(1.0f+wander(&s->f1,&s->seed,0.0007f)*drift*0.4f):1.0f);
+        float f=2.0f*sinf(3.14159265f*clampf(fz,20.0f,18000.0f)/SR);
+        float fb=1.0f-q;
+        for(int ch=0;ch<2;ch++){
+            float *lp=ch?&s->lp_r:&s->lp_l; float *bp=ch?&s->bp_r:&s->bp_l;
+            float x=(ch?r:l)[i];
+            *lp+=f*(*bp)+DENORM;
+            float hp=x-*lp-fb*(*bp);
+            *bp+=f*hp+DENORM;
+            (ch?r:l)[i]=lpw*(*lp)+hpw*hp+bpw*x;       /* tilt = blend lp/hp/dry */
+        }
+    }
+}
+
+/* SQUASH — heavy compressor + overdrive. amount=comp/drive, macro=tone,
+ * drift=threshold jitter. */
+static void fx_squash(slot_dsp_t *s, float *l, float *r, int n,
+                      float amount, float macro, float drift){
+    float thr=0.5f-amount*0.4f, ratio=0.5f+amount*0.45f;
+    float mk=1.0f+amount*2.0f, drive=1.0f+amount*4.0f;
+    float tonec=0.06f+macro*0.5f;
+    for(int i=0;i<n;i++){
+        float mono=0.5f*(fabsf(l[i])+fabsf(r[i]));
+        s->env+=(mono>s->env?0.3f:0.003f)*(mono-s->env)+DENORM;  /* fast attack */
+        float th=thr*(drift>0.0f?(1.0f+wander(&s->f1,&s->seed,0.004f)*drift*0.3f):1.0f);
+        float gr=1.0f; if(s->env>th) gr=1.0f-(1.0f-th/s->env)*ratio;
+        for(int ch=0;ch<2;ch++){
+            float x=tanhf((ch?r:l)[i]*gr*mk*drive)/(0.5f+0.5f*drive);
+            float *z=ch?&s->z1r:&s->z1l; *z+=tonec*(x-*z)+DENORM;
+            (ch?r:l)[i]=lerpf(*z,x,macro);            /* macro = darker↔brighter */
+        }
+    }
+}
+
+/* CASSETTE — wow/flutter + tape sat + HF roll + hiss (mello apply_tape_stage
+ * voicing). amount=degrade intensity, macro=tone, drift=warble depth. */
+static void fx_cassette(slot_dsp_t *s, float *l, float *r, int n,
+                        float amount, float macro, float drift){
+    float wow=0.0006f+amount*0.0016f, flut=0.0002f+amount*0.0006f;
+    float roll=0.06f+ (1.0f-macro)*0.5f;             /* tone: darker at low macro */
+    float hiss=amount*0.004f;
+    float base=SR*0.004f;
+    for(int i=0;i<n;i++){
+        s->lfo+=0.7f/SR; if(s->lfo>=1.0f)s->lfo-=1.0f;     /* wow ~0.7 Hz */
+        s->lfo2+=6.3f/SR; if(s->lfo2>=1.0f)s->lfo2-=1.0f;  /* flutter ~6.3 Hz */
+        float dd=(drift>0.0f? wander(&s->f1,&s->seed,0.002f)*drift:0.0f);
+        float mod=wow*sinf(s->lfo*TWO_PI)*(1.0f+dd) + flut*sinf(s->lfo2*TWO_PI);
+        float d=base*(1.0f+mod*200.0f);
+        s->dl_l[s->wp]=l[i]; s->dl_r[s->wp]=r[i];
+        float xL=dlr(s->dl_l,s->wp,d), xR=dlr(s->dl_r,s->wp,d);
+        s->wp=(s->wp+1)%MAX_DELAY;
+        /* tape sat (asym cubic) + HF rolloff */
+        xL=xL-0.16f*xL*xL*xL; xR=xR-0.16f*xR*xR*xR;
+        s->z1l+=roll*(xL-s->z1l)+DENORM; s->z1r+=roll*(xR-s->z1r)+DENORM;
+        float nz=hiss*((frand(&s->seed)-0.5f)*2.0f);
+        l[i]=lerpf(l[i],s->z1l+nz,amount); r[i]=lerpf(r[i],s->z1r+nz,amount);
+    }
+}
+
+/* BROKEN — motor-failure pitch drops + AM/FM wobble + dropouts. amount=breakdown,
+ * macro=rate of failures, drift=dropout randomness. */
+static void fx_broken(slot_dsp_t *s, float *l, float *r, int n,
+                      float amount, float macro, float drift){
+    float rate=0.1f+macro*macro*3.0f;                /* failure LFO Hz */
+    float base=SR*0.01f;
+    for(int i=0;i<n;i++){
+        s->lfo+=rate/SR; if(s->lfo>=1.0f)s->lfo-=1.0f;
+        /* sawtooth-ish motor slowdown: pitch dips then snaps back */
+        float dip=amount*(0.5f-0.5f*cosf(s->lfo*TWO_PI));
+        float vs=1.0f-dip*0.6f;                       /* varispeed read rate */
+        s->f2+=vs;                                      /* moving read head */
+        float d=base+ (s->wp - (int)s->f2);            /* not used directly; keep simple */
+        (void)d;
+        s->dl_l[s->wp]=l[i]; s->dl_r[s->wp]=r[i];
+        float rd=base*(2.0f-vs);                        /* slow read = lower pitch */
+        float xL=dlr(s->dl_l,s->wp,rd), xR=dlr(s->dl_r,s->wp,rd);
+        s->wp=(s->wp+1)%MAX_DELAY;
+        /* dropout gate */
+        if(drift>0.0f && frand(&s->seed)<drift*0.002f) s->i1=(int)(SR*0.02f*frand(&s->seed));
+        float gate=1.0f; if(s->i1>0){ s->i1--; gate=0.0f; }
+        /* AM wobble */
+        float am=1.0f-amount*0.3f*(0.5f-0.5f*cosf(s->lfo*TWO_PI*2.0f));
+        l[i]=lerpf(l[i],xL*gate*am,amount); r[i]=lerpf(r[i],xR*gate*am,amount);
+    }
+}
+
+/* INTERFERENCE — telecom/radio static: bitcrush + sample-rate reduce + ring-mod
+ * + noise bursts. amount=intensity, macro=tone/carrier, drift=static randomness. */
+static void fx_interference(slot_dsp_t *s, float *l, float *r, int n,
+                            float amount, float macro, float drift){
+    int hold=1+(int)(amount*amount*30.0f);           /* sample-rate reduce */
+    float bits=1.0f+(1.0f-amount)*14.0f; float q=powf(2.0f,bits);
+    float carr=200.0f+macro*macro*3000.0f;            /* ring-mod carrier */
+    float bp=0.05f+macro*0.4f;
+    for(int i=0;i<n;i++){
+        if(s->i1<=0){ s->i1=hold; s->f3=l[i]; s->f4=r[i]; }  /* S&H */
+        s->i1--;
+        float xL=floorf(s->f3*q)/q, xR=floorf(s->f4*q)/q;     /* bitcrush */
+        s->lfo+=carr/SR; if(s->lfo>=1.0f)s->lfo-=1.0f;
+        float rm=sinf(s->lfo*TWO_PI);
+        xL=lerpf(xL,xL*rm,amount*0.5f); xR=lerpf(xR,xR*rm,amount*0.5f);
+        /* telecom bandpass (one-pole HP+LP) */
+        s->z1l+=bp*(xL-s->z1l)+DENORM; s->z1r+=bp*(xR-s->z1r)+DENORM;
+        float nz=(drift>0.0f && frand(&s->seed)<drift*0.05f)?(frand(&s->seed)-0.5f)*drift:0.0f;
+        l[i]=lerpf(l[i],s->z1l+nz,amount); r[i]=lerpf(r[i],s->z1r+nz,amount);
+    }
+}
 
 /* ── Vtable: index by PFX_* id. OFF has no entry (host skips). ───────────────── */
 static const palette_effect_t FX_TABLE[PFX_COUNT] = {
-    [PFX_OFF]          = { fx_passthrough, NULL },
-    [PFX_DRIVE]        = { fx_drive,       NULL },
-    [PFX_SWEETEN]      = { fx_passthrough, NULL },
-    [PFX_FUZZ]         = { fx_passthrough, NULL },
-    [PFX_HOWL]         = { fx_passthrough, NULL },
-    [PFX_SWELL]        = { fx_passthrough, NULL },
-    [PFX_FOLD]         = { fx_passthrough, NULL },  /* Warps ALGORITHM_FOLD */
-    [PFX_DOUBLER]      = { fx_passthrough, NULL },
-    [PFX_VIBRATO]      = { fx_passthrough, NULL },
-    [PFX_PHASER]       = { fx_passthrough, NULL },
-    [PFX_TREMOLO]      = { fx_tremolo,     NULL },
-    [PFX_PITCH]        = { fx_passthrough, NULL },
-    [PFX_SHIFT]        = { fx_passthrough, NULL },  /* Warps quadrature SSB shift */
-    [PFX_CASCADE]      = { fx_passthrough, NULL },
-    [PFX_REELS]        = { fx_passthrough, NULL },  /* KrautDrums RE-201 */
-    [PFX_SPACE]        = { fx_passthrough, NULL },  /* Clouds reverb */
-    [PFX_COLLAGE]      = { fx_passthrough, NULL },
-    [PFX_REVERSE]      = { fx_passthrough, NULL },
-    [PFX_BLOOM]        = { fx_passthrough, NULL },  /* grain cloud + shimmer */
-    [PFX_FILTER]       = { fx_filter,      NULL },
-    [PFX_SQUASH]       = { fx_passthrough, NULL },
-    [PFX_CASSETTE]     = { fx_passthrough, NULL },  /* Mello apply_tape_stage */
-    [PFX_BROKEN]       = { fx_passthrough, NULL },
-    [PFX_INTERFERENCE] = { fx_passthrough, NULL },
-    [PFX_FREEZE]       = { fx_passthrough, NULL },  /* Verglas spectral freeze */
+    [PFX_OFF]          = { fx_passthrough,   NULL },
+    [PFX_DRIVE]        = { fx_drive,         NULL },
+    [PFX_SWEETEN]      = { fx_sweeten,       NULL },
+    [PFX_FUZZ]         = { fx_fuzz,          NULL },
+    [PFX_HOWL]         = { fx_howl,          NULL },
+    [PFX_SWELL]        = { fx_swell,         NULL },
+    [PFX_FOLD]         = { fx_fold,          NULL },
+    [PFX_DOUBLER]      = { fx_doubler,       NULL },
+    [PFX_VIBRATO]      = { fx_vibrato,       NULL },
+    [PFX_PHASER]       = { fx_phaser,        NULL },
+    [PFX_TREMOLO]      = { fx_tremolo,       NULL },
+    [PFX_PITCH]        = { fx_pitch,         NULL },
+    [PFX_SHIFT]        = { fx_shift,         NULL },
+    [PFX_CASCADE]      = { fx_cascade,       NULL },
+    [PFX_REELS]        = { fx_reels,         NULL },
+    [PFX_SPACE]        = { fx_passthrough,   NULL },  /* Clouds (heavy) — dispatched specially */
+    [PFX_COLLAGE]      = { fx_collage,       NULL },
+    [PFX_REVERSE]      = { fx_reverse,       NULL },
+    [PFX_BLOOM]        = { fx_passthrough,   NULL },  /* Clouds (heavy) — dispatched specially */
+    [PFX_FILTER]       = { fx_filter,        NULL },
+    [PFX_SQUASH]       = { fx_squash,        NULL },
+    [PFX_CASSETTE]     = { fx_cassette,      NULL },
+    [PFX_BROKEN]       = { fx_broken,        NULL },
+    [PFX_INTERFERENCE] = { fx_interference,  NULL },
+    [PFX_FREEZE]       = { fx_passthrough,   NULL },  /* Clouds (heavy) — dispatched specially */
 };
 
+/* Clear all per-effect scratch on switch. Preserves the delay-line allocation,
+ * the heavy (Clouds) pointer, and the RNG seed; zeroes the delay buffers. */
 static void slot_reset(slot_t *sl){
-    sl->dsp.wp=0; sl->dsp.lfo=0;
-    sl->dsp.z1l=sl->dsp.z1r=sl->dsp.z2l=sl->dsp.z2r=0; sl->dsp.env=0;
-    if(sl->dsp.dl_l) memset(sl->dsp.dl_l,0,MAX_DELAY*sizeof(float));
-    if(sl->dsp.dl_r) memset(sl->dsp.dl_r,0,MAX_DELAY*sizeof(float));
+    float *dl_l=sl->dsp.dl_l, *dl_r=sl->dsp.dl_r;
+    void  *heavy=sl->dsp.heavy; int hk=sl->dsp.heavy_kind;
+    uint32_t seed=sl->dsp.seed;
+    memset(&sl->dsp, 0, sizeof(slot_dsp_t));
+    sl->dsp.dl_l=dl_l; sl->dsp.dl_r=dl_r;
+    sl->dsp.heavy=heavy; sl->dsp.heavy_kind=hk; sl->dsp.seed=seed;
+    if(dl_l) memset(dl_l,0,MAX_DELAY*sizeof(float));
+    if(dl_r) memset(dl_r,0,MAX_DELAY*sizeof(float));
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -287,13 +752,28 @@ static int resolve_select(palette_t *p, int slot, int requested, int dir){
         if(v==PFX_OFF || !effect_taken(p,v,slot)) return v;
     return PFX_OFF;
 }
-static void set_slot_select(palette_t *p, int slot, int requested, int dir){
-    int landed = resolve_select(p,slot,requested,dir);
-    if(landed != p->slots[slot].select){
-        p->slots[slot].prev_select = p->slots[slot].select;
-        p->slots[slot].select = landed;
-        slot_reset(&p->slots[slot]);     /* clear buffers on effect change */
+/* Heavy-aware effect assignment — the single path for ALL select changes
+ * (manual scroll, direct set, randomizer, preset load). Manages Clouds heavy
+ * state (free on kind change, alloc on entering a Clouds effect) and arms the
+ * click-free fade-in ramp. */
+static void slot_apply_select(palette_t *p, int slot, int landed){
+    slot_t *sl=&p->slots[slot];
+    if(landed == sl->select) return;
+    sl->prev_select = sl->select;
+    sl->select = landed;
+    if(sl->dsp.heavy && sl->dsp.heavy_kind != landed){
+        pfx_clouds_free(sl->dsp.heavy);
+        sl->dsp.heavy=NULL; sl->dsp.heavy_kind=0;
     }
+    if(is_clouds_fx(landed) && !sl->dsp.heavy){
+        sl->dsp.heavy = pfx_clouds_alloc(landed, SR);
+        sl->dsp.heavy_kind = sl->dsp.heavy ? landed : 0;
+    }
+    slot_reset(sl);                  /* clear scratch (heavy preserved) */
+    sl->ramp = 0.0f;                 /* fade in from silence to avoid clicks */
+}
+static void set_slot_select(palette_t *p, int slot, int requested, int dir){
+    slot_apply_select(p, slot, resolve_select(p,slot,requested,dir));
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -303,11 +783,10 @@ static void set_slot_select(palette_t *p, int slot, int requested, int dir){
 static void pick_distinct_effects(palette_t *p, uint32_t *rng){
     int pool[NUM_FX]; for(int i=0;i<NUM_FX;i++) pool[i]=i+1;   /* 1..24 */
     for(int i=NUM_FX-1;i>0;i--){ int j=rnd_int(rng,i+1); int t=pool[i];pool[i]=pool[j];pool[j]=t; }
-    for(int s=0;s<NUM_SLOTS;s++){
-        p->slots[s].prev_select=p->slots[s].select;
-        p->slots[s].select=pool[s];
-        slot_reset(&p->slots[s]);
-    }
+    /* Free any current selections first so a Clouds effect can move slots without
+     * a transient double-allocation, then assign the 4 distinct picks. */
+    for(int s=0;s<NUM_SLOTS;s++) slot_apply_select(p,s,PFX_OFF);
+    for(int s=0;s<NUM_SLOTS;s++) slot_apply_select(p,s,pool[s]);
 }
 static void rnd_patch(palette_t *p){                 /* everything new */
     pick_distinct_effects(p,&p->rng);
@@ -346,7 +825,10 @@ static void *create_instance(const char *module_dir, const char *json){
 }
 static void destroy_instance(void *instance){
     palette_t *p=(palette_t*)instance; if(!p) return;
-    for(int s=0;s<NUM_SLOTS;s++){ free(p->slots[s].dsp.dl_l); free(p->slots[s].dsp.dl_r); }
+    for(int s=0;s<NUM_SLOTS;s++){
+        if(p->slots[s].dsp.heavy) pfx_clouds_free(p->slots[s].dsp.heavy);
+        free(p->slots[s].dsp.dl_l); free(p->slots[s].dsp.dl_r);
+    }
     free(p);
 }
 
@@ -474,6 +956,35 @@ static int get_param(void *instance, const char *key, char *buf, int buf_len){
 
     if(!strcmp(key,"name")) return snprintf(buf,buf_len,"PALETTE");
 
+    /* ui_hierarchy — MUST mirror module.json; host reads this at runtime (priority).
+     * Without it the module falls back to the preset browser and pages are unreachable.
+     * Root = Presets landing (knobs = preset row; params = page links + menu-only FX Reorder).
+     * Sub-level params are STRING arrays (Signal/Bobines lesson); metadata lives in chain_params. */
+    if(!strcmp(key,"ui_hierarchy")){
+        int o=0;
+        o+=snprintf(buf+o,buf_len-o,
+          "{\"modes\":null,\"levels\":{"
+          "\"root\":{\"name\":\"PALETTE\","
+          "\"knobs\":[\"current_preset\",\"rnd_patch\",\"rnd_effect\",\"rnd_amount\",\"rnd_macro\",\"rnd_drift\",\"input_vol\",\"mix\"],"
+          "\"params\":["
+          "{\"level\":\"PALETTE\",\"label\":\"PALETTE\"},"
+          "{\"level\":\"FX12\",\"label\":\"FX 1&2\"},"
+          "{\"level\":\"FX34\",\"label\":\"FX 3&4\"},"
+          "{\"key\":\"fx_reorder\",\"label\":\"FX Reorder\"}"
+          "]},"
+          "\"PALETTE\":{\"name\":\"PALETTE\","
+          "\"knobs\":[\"fx1_amount\",\"fx1_macro\",\"fx2_amount\",\"fx2_macro\",\"fx3_amount\",\"fx3_macro\",\"fx4_amount\",\"fx4_macro\"],"
+          "\"params\":[\"fx1_amount\",\"fx1_macro\",\"fx2_amount\",\"fx2_macro\",\"fx3_amount\",\"fx3_macro\",\"fx4_amount\",\"fx4_macro\"]},"
+          "\"FX12\":{\"name\":\"FX 1&2\","
+          "\"knobs\":[\"fx1_select\",\"fx1_amount\",\"fx1_macro\",\"fx1_drift\",\"fx2_select\",\"fx2_amount\",\"fx2_macro\",\"fx2_drift\"],"
+          "\"params\":[\"fx1_select\",\"fx1_amount\",\"fx1_macro\",\"fx1_drift\",\"fx2_select\",\"fx2_amount\",\"fx2_macro\",\"fx2_drift\"]},"
+          "\"FX34\":{\"name\":\"FX 3&4\","
+          "\"knobs\":[\"fx3_select\",\"fx3_amount\",\"fx3_macro\",\"fx3_drift\",\"fx4_select\",\"fx4_amount\",\"fx4_macro\",\"fx4_drift\"],"
+          "\"params\":[\"fx3_select\",\"fx3_amount\",\"fx3_macro\",\"fx3_drift\",\"fx4_select\",\"fx4_amount\",\"fx4_macro\",\"fx4_drift\"]}"
+          "}}");
+        return o;
+    }
+
     if(!strcmp(key,"chain_params")){
         /* ALL params from ALL pages. selects/reorder are enums (name strings);
          * rnd_* are int tap-to-fire; amount/macro/drift/mix float; input_vol float. */
@@ -498,7 +1009,12 @@ static int get_param(void *instance, const char *key, char *buf, int buf_len){
           "{\"key\":\"rnd_effect\",\"name\":\"Rnd FX\",\"type\":\"int\",\"min\":0,\"max\":127,\"step\":1},"
           "{\"key\":\"rnd_amount\",\"name\":\"Rnd Amt\",\"type\":\"int\",\"min\":0,\"max\":127,\"step\":1},"
           "{\"key\":\"rnd_macro\",\"name\":\"Rnd Macro\",\"type\":\"int\",\"min\":0,\"max\":127,\"step\":1},"
-          "{\"key\":\"rnd_drift\",\"name\":\"Rnd Drift\",\"type\":\"int\",\"min\":0,\"max\":127,\"step\":1}");
+          "{\"key\":\"rnd_drift\",\"name\":\"Rnd Drift\",\"type\":\"int\",\"min\":0,\"max\":127,\"step\":1},");
+        /* FX Reorder — menu-only enum of all 24 chain permutations */
+        o+=snprintf(buf+o,buf_len-o,"{\"key\":\"fx_reorder\",\"name\":\"FX Reorder\",\"type\":\"enum\",\"options\":[");
+        for(int i=0;i<24;i++){ char lb[16]; perm_label(i,lb,sizeof lb);
+            o+=snprintf(buf+o,buf_len-o,"%s\"%s\"",i?",":"",lb); }
+        o+=snprintf(buf+o,buf_len-o,"]}");
         o+=snprintf(buf+o,buf_len-o,"]");
         return o;
     }
@@ -570,18 +1086,42 @@ static void process_block(void *instance, int16_t *buf, int frames){
         dryL[i]=l; dryR[i]=r;
         p->L[i]=l*iv; p->R[i]=r*iv;
     }
-    /* run the 4 slots in reorder sequence (Off = passthrough, never dispatched) */
+    /* run the 4 slots in reorder sequence (Off = passthrough, never dispatched).
+     * Clouds effects dispatch through the opaque heavy interface; C effects use the
+     * vtable. A just-switched slot fades input→output over ~12 ms (click-free). */
+    const float ramp_inc = 1.0f / (SR * 0.012f);
+    float preL[MAXFRAMES], preR[MAXFRAMES];
     for(int k=0;k<NUM_SLOTS;k++){
         slot_t *sl=&p->slots[order[k]];
-        if(sl->select==PFX_OFF) continue;
-        FX_TABLE[sl->select].process(&sl->dsp, p->L, p->R, frames,
-                                     sl->amount, sl->macro, sl->drift);
+        int fx=sl->select;
+        if(fx==PFX_OFF) continue;
+        int ramping = sl->ramp < 1.0f;
+        if(ramping){ memcpy(preL,p->L,frames*sizeof(float)); memcpy(preR,p->R,frames*sizeof(float)); }
+        if(is_clouds_fx(fx)){
+            if(sl->dsp.heavy)
+                pfx_clouds_process(fx, sl->dsp.heavy, p->L, p->R, frames,
+                                   sl->amount, sl->macro, sl->drift);
+            /* heavy alloc failed → leave signal untouched (passthrough) */
+        } else {
+            FX_TABLE[fx].process(&sl->dsp, p->L, p->R, frames,
+                                 sl->amount, sl->macro, sl->drift);
+        }
+        if(ramping){
+            float rr=sl->ramp;
+            for(int i=0;i<frames;i++){
+                float g=rr+ramp_inc*(float)i; if(g>1.0f)g=1.0f;
+                p->L[i]=preL[i]*(1.0f-g)+p->L[i]*g;
+                p->R[i]=preR[i]*(1.0f-g)+p->R[i]*g;
+            }
+            sl->ramp = rr + ramp_inc*(float)frames; if(sl->ramp>1.0f) sl->ramp=1.0f;
+        }
     }
-    /* equal-power dry/wet + write back */
+    /* equal-power dry/wet + write back (NaN-guarded — many effects feed back) */
     float a=p->mix*1.5707963f, dg=cosf(a), wg=sinf(a);
     for(int i=0;i<frames;i++){
         float ol=dg*dryL[i]+wg*p->L[i];
         float orr=dg*dryR[i]+wg*p->R[i];
+        if(ol!=ol) ol=0.0f; if(orr!=orr) orr=0.0f;
         int32_t il=(int32_t)(ol*32767.0f), ir=(int32_t)(orr*32767.0f);
         if(il>32767)il=32767; if(il<-32768)il=-32768;
         if(ir>32767)ir=32767; if(ir<-32768)ir=-32768;
