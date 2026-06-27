@@ -1,0 +1,77 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify version match
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          MODULE_VERSION=$(grep '"version"' src/module.json | head -1 | sed 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')
+          if [ "$TAG_VERSION" != "$MODULE_VERSION" ]; then
+            echo "ERROR: Tag version ($TAG_VERSION) does not match module.json version ($MODULE_VERSION)"
+            exit 1
+          fi
+          echo "Version check passed: $TAG_VERSION"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build with Docker
+        run: |
+          docker build -t module-builder -f scripts/Dockerfile .
+          docker run --rm -v "$PWD:/repo" module-builder bash -c '
+            set -e
+            shopt -s nullglob
+            dos2unix /repo/src/dsp/*.c /repo/src/dsp/*.cc /repo/src/dsp/*.cpp 2>/dev/null || true
+            mkdir -p /repo/dist/palette /repo/obj
+            CFLAGS="-O2 -fPIC -ffast-math -I/repo/src/dsp -I/repo/vendor"
+            CXXFLAGS="-O2 -fPIC -ffast-math -std=c++11 -fno-exceptions -fno-rtti -I/repo/src/dsp -I/repo/vendor"
+            OBJS=()
+            for f in /repo/src/dsp/*.c; do
+              o="/repo/obj/$(basename "${f%.c}").o"
+              aarch64-linux-gnu-gcc $CFLAGS -c "$f" -o "$o"; OBJS+=("$o")
+            done
+            for f in /repo/src/dsp/*.cc /repo/src/dsp/*.cpp; do
+              o="/repo/obj/$(basename "${f%.*}").o"
+              aarch64-linux-gnu-g++ $CXXFLAGS -c "$f" -o "$o"; OBJS+=("$o")
+            done
+            aarch64-linux-gnu-g++ -O2 -shared -fPIC -o /repo/dist/palette/palette.so "${OBJS[@]}" -lm
+            cp /repo/src/module.json /repo/dist/palette/
+            cd /repo && tar -czf dist/palette-module.tar.gz -C dist palette
+          '
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/palette-module.tar.gz
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Commit release.json
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          BRANCH=$(git remote show origin | sed -n '/HEAD branch/s/.*: //p')
+          git fetch origin "$BRANCH"
+          git checkout -f "$BRANCH"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          cat > release.json << EOF
+          {
+            "version": "${VERSION}",
+            "download_url": "https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/palette-module.tar.gz"
+          }
+          EOF
+          git add release.json
+          git commit -m "ci: update release.json for ${{ github.ref_name }}" || echo "No changes to commit"
+          git push origin "$BRANCH"

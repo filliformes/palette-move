@@ -1,0 +1,7 @@
+dist/
+build/
+obj/
+*.o
+*.so
+modules/
+.claude/

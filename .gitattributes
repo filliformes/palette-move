@@ -1,0 +1,8 @@
+# Keep LF on shell scripts and the Dockerfile so the Docker ARM64 build doesn't choke
+# on CRLF (set -e / heredoc breakage). build.sh also runs dos2unix as a belt-and-braces.
+*.sh    text eol=lf
+Dockerfile text eol=lf
+*.c     text eol=lf
+*.h     text eol=lf
+*.cc    text eol=lf
+*.cpp   text eol=lf
