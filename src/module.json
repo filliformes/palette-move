@@ -8,6 +8,7 @@
   "dsp": "palette.so",
   "api_version": 2,
   "component_type": "audio_fx",
+  "raw_midi": true,
   "capabilities": {
     "chainable": true,
     "component_type": "audio_fx",

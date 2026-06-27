@@ -48,6 +48,7 @@ jobs:
             done
             aarch64-linux-gnu-g++ -O2 -shared -fPIC -o /repo/dist/palette/palette.so "${OBJS[@]}" -lm
             cp /repo/src/module.json /repo/dist/palette/
+            [ -f /repo/src/help.json ] && cp /repo/src/help.json /repo/dist/palette/ || true
             cd /repo && tar -czf dist/palette-module.tar.gz -C dist palette
           '
 

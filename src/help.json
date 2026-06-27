@@ -1,0 +1,94 @@
+{
+  "title": "PALETTE",
+  "children": [
+    {
+      "title": "Overview",
+      "lines": [
+        "4-slot serial multi-FX,",
+        "24-effect palette. Chroma",
+        "Console reimagined.",
+        "",
+        "Each slot loads any effect",
+        "(once each). Reorder live.",
+        "Stereo throughout."
+      ]
+    },
+    {
+      "title": "Pages",
+      "lines": [
+        "PALETTE: 8-knob console",
+        " (FX1-4 Amount/Macro).",
+        "PRESETS&RND: presets +",
+        " randomizers + Reorder.",
+        "FX 1&2 / FX 3&4: per-slot",
+        " Select/Amount/Macro/Drift.",
+        "GLOBAL: feedback + tempo."
+      ]
+    },
+    {
+      "title": "Knobs",
+      "lines": [
+        "Amount: how much. At 0%",
+        " the effect is bypassed",
+        " (loaded, silent, ready).",
+        "Macro: secondary control,",
+        " differs per effect (tone,",
+        " rate, size, pitch...).",
+        "Drift: instability macro,",
+        " musical at every position."
+      ]
+    },
+    {
+      "title": "Effects",
+      "lines": [
+        "Character: Drive Sweeten",
+        " Fuzz Howl Fold Swell.",
+        "Movement: Doubler Vibrato",
+        " Phaser Tremolo Pitch Shift.",
+        "Diffusion: Cascade Reels",
+        " Collage Reverse Space Bloom.",
+        "Texture: Filter Squash",
+        " Cassette Broken Intf Freeze.",
+        "Selecting a taken effect",
+        " skips it (each once)."
+      ]
+    },
+    {
+      "title": "GLOBAL page",
+      "lines": [
+        "Feedback: chain out to in.",
+        " Drones, infinite verbs,",
+        " self-osc. Start low!",
+        "Tempo Src: Move or Int.",
+        "Tempo: 10-500 BPM (Int).",
+        "Time Div: Free or a",
+        " division (1/4, 1/8, T, D).",
+        " Syncs delays + LFOs."
+      ]
+    },
+    {
+      "title": "Presets",
+      "lines": [
+        "50 presets, grouped",
+        " utilitarian to wild.",
+        "Each loads 4 distinct FX",
+        " (extras at 0%, ready).",
+        "Rnd knobs are momentary:",
+        " one tap fires once.",
+        "Tempo & Feedback stay",
+        " global across presets."
+      ]
+    },
+    {
+      "title": "Tips",
+      "lines": [
+        "Keep 4 FX at 0% and ride",
+        " the Amount knobs live.",
+        "Filter = DJ HP/LP sweep,",
+        " Macro = resonance.",
+        "Tremolo Drift = AutoPan.",
+        "Power-cycle after install."
+      ]
+    }
+  ]
+}
