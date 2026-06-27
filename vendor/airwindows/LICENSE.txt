@@ -1,0 +1,4 @@
+Airwindows plugins by Chris Johnson — MIT License (Copyright (c) 2018 Chris Johnson).
+Source: https://github.com/airwindows/Airwindows
+Only the per-sample DSP from each <Name>Proc.cpp is ported into PALETTE effects;
+VST scaffolding and dither are dropped. Each port is attributed in-code.

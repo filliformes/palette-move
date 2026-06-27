@@ -593,23 +593,47 @@ static void fx_filter(slot_dsp_t *s, float *l, float *r, int n,
     }
 }
 
-/* SQUASH — heavy compressor + overdrive. amount=comp/drive, macro=tone,
- * drift=threshold jitter. */
+/* SQUASH — vari-mu compressor + overdrive. PORTED from Airwindows Pressure4
+ * (Chris Johnson, MIT). amount=compression, macro=mu character (punchy↔smooth),
+ * drift=threshold jitter. State: f1/f2=muSpeed A/B, f3/f4=muCoeff A/B, i1=flip.
+ * Faithful to the Pressure4 per-sample algorithm; VST/dither scaffolding dropped. */
 static void fx_squash(slot_dsp_t *s, float *l, float *r, int n,
                       float amount, float macro, float drift){
-    float thr=0.5f-amount*0.4f, ratio=0.5f+amount*0.45f;
-    float mk=1.0f+amount*2.0f, drive=1.0f+amount*4.0f;
-    float tonec=0.06f+macro*0.5f;
+    if(s->f1<1.0f){ s->f1=s->f2=10000.0f; s->f3=s->f4=1.0f; } /* Pressure4 ctor inits */
+    float A=clampf(amount,0.0f,1.0f), B=0.4f;          /* B = release speed (fixed, musical) */
+    float threshold=1.0f-(A*0.95f);
+    float muMakeupGain=1.0f/threshold;
+    float release=powf(1.28f-B,5.0f)*32768.0f;          /* overallscale = 1 @ 44.1k */
+    float fastest=sqrtf(release);
+    float mewiness=(macro*2.0f)-1.0f, unmew;
+    int positivemu; if(mewiness>=0){positivemu=1;unmew=1.0f-mewiness;}
+                    else{positivemu=0;mewiness=-mewiness;unmew=1.0f-mewiness;}
+    float outGain=1.0f+A*0.6f;                           /* gentle makeup */
     for(int i=0;i<n;i++){
-        float mono=0.5f*(fabsf(l[i])+fabsf(r[i]));
-        s->env+=(mono>s->env?0.3f:0.003f)*(mono-s->env)+DENORM;  /* fast attack */
-        float th=thr*(drift>0.0f?(1.0f+wander(&s->f1,&s->seed,0.004f)*drift*0.3f):1.0f);
-        float gr=1.0f; if(s->env>th) gr=1.0f-(1.0f-th/s->env)*ratio;
-        for(int ch=0;ch<2;ch++){
-            float x=tanhf((ch?r:l)[i]*gr*mk*drive)/(0.5f+0.5f*drive);
-            float *z=ch?&s->z1r:&s->z1l; *z+=tonec*(x-*z)+DENORM;
-            (ch?r:l)[i]=lerpf(*z,x,macro);            /* macro = darker↔brighter */
+        float th=threshold*(drift>0.0f?(1.0f+wander(&s->f5,&s->seed,0.004f)*drift*0.2f):1.0f);
+        float xl=l[i]*muMakeupGain, xr=r[i]*muMakeupGain;
+        float sense=fabsf(xl); if(fabsf(xr)>sense) sense=fabsf(xr);
+        float *spd = s->i1?&s->f1:&s->f2;                /* muSpeedA/B */
+        float *cof = s->i1?&s->f3:&s->f4;                /* muCoefficientA/B */
+        if(sense>th){
+            float muVary=th/sense, muAttack=sqrtf(fabsf(*spd));
+            *cof = *cof*(muAttack-1.0f);
+            *cof += (muVary<th)? th : muVary;
+            *cof /= muAttack;
+        } else {
+            *cof = *cof*((*spd)*(*spd)-1.0f) + 1.0f;
+            *cof /= (*spd)*(*spd);
         }
+        float ns=(*spd)*((*spd)-1.0f) + fabsf(sense*release)+fastest;
+        *spd = ns/(*spd);
+        float coeff = positivemu? (*cof)*(*cof) : sqrtf(fabsf(*cof));
+        coeff = coeff*mewiness + (*cof)*unmew;
+        xl*=coeff*outGain; xr*=coeff*outGain;
+        /* Pressure4 second-stage sin() overdrive */
+        float br=fabsf(xl); br=(br>1.57079633f)?1.0f:sinf(br); xl=(xl>0)?br:-br;
+        br=fabsf(xr);      br=(br>1.57079633f)?1.0f:sinf(br); xr=(xr>0)?br:-br;
+        l[i]=xl; r[i]=xr;
+        s->i1^=1;
     }
 }
 
