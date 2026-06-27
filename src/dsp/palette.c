@@ -801,6 +801,65 @@ static void rnd_amount(palette_t *p){ for(int s=0;s<NUM_SLOTS;s++) p->slots[s].a
 static void rnd_macro (palette_t *p){ for(int s=0;s<NUM_SLOTS;s++) p->slots[s].macro =frand(&p->rng); }
 static void rnd_drift (palette_t *p){ for(int s=0;s<NUM_SLOTS;s++) p->slots[s].drift =frand(&p->rng); }
 
+/* ═══════════════════════════════════════════════════════════════════════════
+ *  PRESETS — 25 factory patches. Each shows a chain the Chroma physically can't
+ *  do (delay→reverb, stacked distinct effects, FOLD→SPACE…). amt/mac/drf are
+ *  percent (0..100); ivol is percent of unity×2 (100 = unity); reorder is 0..23.
+ *  The 4 effects per preset are DISTINCT (uniqueness); Off may repeat.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+typedef struct {
+    const char *name;
+    uint8_t fx[4];                 /* PFX_* per slot */
+    uint8_t amt[4], mac[4], drf[4];/* 0..100 */
+    uint8_t mix, ivol, reorder;
+} preset_t;
+
+static const preset_t PRESETS[25] = {
+/*  name              fx1..4                                  amt              mac              drf            mix ivol ord */
+{"Init",          {PFX_OFF,PFX_OFF,PFX_OFF,PFX_OFF},          {0,0,0,0},       {0,0,0,0},       {0,0,0,0},     100,100,0},
+{"Delay + Verb",  {PFX_CASCADE,PFX_SPACE,PFX_OFF,PFX_OFF},    {55,45,0,0},     {45,60,0,0},     {15,10,0,0},   100,100,0},
+{"Tape Space",    {PFX_REELS,PFX_BLOOM,PFX_OFF,PFX_OFF},      {50,55,0,0},     {40,70,0,0},     {25,15,0,0},   100,100,0},
+{"Fold Bloom",    {PFX_FOLD,PFX_SPACE,PFX_OFF,PFX_OFF},       {45,55,0,0},     {55,65,0,0},     {15,10,0,0},   100,95,0},
+{"Freeze Reels",  {PFX_FREEZE,PFX_REELS,PFX_OFF,PFX_OFF},     {60,40,0,0},     {50,45,0,0},     {20,20,0,0},   100,100,0},
+{"Shimmer Drive", {PFX_DRIVE,PFX_BLOOM,PFX_OFF,PFX_OFF},      {40,60,0,0},     {55,75,0,0},     {10,15,0,0},   100,100,0},
+{"Fuzz Phaze Vrb",{PFX_FUZZ,PFX_PHASER,PFX_SPACE,PFX_OFF},    {50,55,45,0},    {45,50,60,0},    {20,15,10,0},  100,95,0},
+{"West Coast",    {PFX_FOLD,PFX_FILTER,PFX_SPACE,PFX_OFF},    {55,50,40,0},    {50,55,60,0},    {15,10,10,0},  100,95,0},
+{"Glitch Cloud",  {PFX_COLLAGE,PFX_FREEZE,PFX_SPACE,PFX_OFF}, {55,50,45,0},    {45,55,65,0},    {30,20,10,0},  100,100,0},
+{"Vibe Verb",     {PFX_VIBRATO,PFX_SPACE,PFX_OFF,PFX_OFF},    {35,50,0,0},     {40,60,0,0},     {20,10,0,0},   100,100,0},
+{"Slap Double",   {PFX_DOUBLER,PFX_CASCADE,PFX_OFF,PFX_OFF},  {55,45,0,0},     {40,35,0,0},     {15,15,0,0},   100,100,0},
+{"Lo-fi Tape",    {PFX_CASSETTE,PFX_REELS,PFX_OFF,PFX_OFF},   {55,45,0,0},     {40,50,0,0},     {25,20,0,0},   100,100,0},
+{"Broken Radio",  {PFX_BROKEN,PFX_INTERFERENCE,PFX_OFF,PFX_OFF},{45,50,0,0},   {40,45,0,0},     {25,30,0,0},   95,100,0},
+{"Swell Pad",     {PFX_SWELL,PFX_SPACE,PFX_BLOOM,PFX_OFF},    {60,50,45,0},    {50,65,70,0},    {10,10,15,0},  100,100,0},
+{"Octave Shift",  {PFX_SHIFT,PFX_BLOOM,PFX_OFF,PFX_OFF},      {45,55,0,0},     {60,70,0,0},     {15,15,0,0},   100,100,0},
+{"Pitch Cloud",   {PFX_PITCH,PFX_COLLAGE,PFX_SPACE,PFX_OFF},  {50,45,45,0},    {65,50,60,0},    {15,25,10,0},  100,100,0},
+{"Howl Stab",     {PFX_HOWL,PFX_REELS,PFX_OFF,PFX_OFF},       {55,40,0,0},     {50,45,0,0},     {20,15,0,0},   100,95,0},
+{"Squash Drive",  {PFX_SQUASH,PFX_DRIVE,PFX_OFF,PFX_OFF},     {55,45,0,0},     {50,55,0,0},     {15,10,0,0},   100,100,0},
+{"Tremolo Verb",  {PFX_TREMOLO,PFX_SPACE,PFX_OFF,PFX_OFF},    {45,50,0,0},     {45,60,0,0},     {15,10,0,0},   100,100,0},
+{"Reverse Bloom", {PFX_REVERSE,PFX_BLOOM,PFX_OFF,PFX_OFF},    {50,55,0,0},     {45,70,0,0},     {15,15,0,0},   100,100,0},
+{"Sweeten Tape",  {PFX_SWEETEN,PFX_CASSETTE,PFX_OFF,PFX_OFF}, {50,45,0,0},     {55,40,0,0},     {10,20,0,0},   100,100,0},
+{"Filt Dly Verb", {PFX_FILTER,PFX_CASCADE,PFX_SPACE,PFX_OFF}, {50,50,45,0},    {50,45,60,0},    {15,15,10,0},  100,100,0},
+{"Intf Freeze",   {PFX_INTERFERENCE,PFX_FREEZE,PFX_OFF,PFX_OFF},{50,55,0,0},   {45,55,0,0},     {30,20,0,0},   100,100,0},
+{"Full Chain",    {PFX_DRIVE,PFX_PHASER,PFX_REELS,PFX_SPACE}, {40,45,45,40},   {50,50,45,60},   {10,15,15,10}, 100,95,0},
+{"Ambient Wash",  {PFX_SWELL,PFX_SHIFT,PFX_BLOOM,PFX_FREEZE}, {60,40,55,45},   {50,60,70,55},   {10,15,15,20}, 100,100,0},
+};
+
+/* Apply a factory preset: heavy-aware select for all 4 slots, then snap params. */
+static void load_preset(palette_t *p, int idx){
+    idx=clampi(idx,1,25);
+    const preset_t *pr=&PRESETS[idx-1];
+    for(int s=0;s<NUM_SLOTS;s++) slot_apply_select(p,s,PFX_OFF);   /* clear (frees heavy) */
+    for(int s=0;s<NUM_SLOTS;s++){
+        slot_apply_select(p,s, clampi(pr->fx[s],0,NUM_FX));
+        p->slots[s].amount=pr->amt[s]/100.0f;
+        p->slots[s].macro =pr->mac[s]/100.0f;
+        p->slots[s].drift =pr->drf[s]/100.0f;
+    }
+    p->mix=pr->mix/100.0f;
+    p->input_vol=pr->ivol/100.0f;
+    p->fx_reorder=clampi(pr->reorder,0,23);
+    p->current_preset=idx;
+}
+
 /* ── Lifecycle ───────────────────────────────────────────────────────────────── */
 static void *create_instance(const char *module_dir, const char *json){
     (void)module_dir;(void)json;
@@ -896,8 +955,7 @@ static void apply_knob_delta(palette_t *p, const char *key, int delta){
         return;
     }
     if(!strcmp(key,"current_preset")){
-        p->current_preset = clampi(p->current_preset+delta,1,25);
-        /* TODO: load_preset(p, p->current_preset); */
+        load_preset(p, clampi(p->current_preset+delta,1,25));
         return;
     }
     if(!strncmp(key,"rnd_",4)){ if(delta!=0) fire_trigger(p,key); return; }
@@ -936,8 +994,7 @@ static void set_param(void *instance, const char *key, const char *val){
     /* triggers: wide-range int tap-to-fire (NOT enum["0","1"]) */
     if(!strncmp(key,"rnd_",4)){ if(atoi(val)!=0) fire_trigger(p,key); return; }
 
-    if(!strcmp(key,"current_preset")){ p->current_preset=clampi(atoi(val),1,25);
-        /* TODO load_preset */ return; }
+    if(!strcmp(key,"current_preset")){ load_preset(p, clampi(atoi(val),1,25)); return; }
     if(!strcmp(key,"fx_reorder")){
         /* accept "1-2-3-4" label or index */
         int idx=-1; for(int i=0;i<24;i++){ char lb[16]; perm_label(i,lb,sizeof lb);
@@ -945,10 +1002,32 @@ static void set_param(void *instance, const char *key, const char *val){
         if(idx<0) idx=clampi(atoi(val),0,23);
         p->fx_reorder=idx; return;
     }
+    /* full-state restore (per-Set persistence). CSV: 4×(sel,amt,mac,drf),mix,ivol,ord,preset */
+    if(!strcmp(key,"state")){
+        int sel[4],ord=0,pre=1; float a[4],m[4],d[4],mix=1.0f,iv=1.0f;
+        int got=sscanf(val,
+            "%d,%f,%f,%f,%d,%f,%f,%f,%d,%f,%f,%f,%d,%f,%f,%f,%f,%f,%d,%d",
+            &sel[0],&a[0],&m[0],&d[0], &sel[1],&a[1],&m[1],&d[1],
+            &sel[2],&a[2],&m[2],&d[2], &sel[3],&a[3],&m[3],&d[3],
+            &mix,&iv,&ord,&pre);
+        if(got>=18){
+            for(int s=0;s<NUM_SLOTS;s++) slot_apply_select(p,s,PFX_OFF);   /* frees heavy */
+            for(int s=0;s<NUM_SLOTS;s++){
+                slot_apply_select(p,s,clampi(sel[s],0,NUM_FX));
+                p->slots[s].amount=clampf(a[s],0,1);
+                p->slots[s].macro =clampf(m[s],0,1);
+                p->slots[s].drift =clampf(d[s],0,1);
+                p->slots[s].ramp=1.0f;            /* no fade on state restore */
+            }
+            p->mix=clampf(mix,0,1); p->input_vol=clampf(iv,0,2);
+            p->fx_reorder=clampi(ord,0,23);
+            if(got>=20) p->current_preset=clampi(pre,1,25);
+        }
+        return;
+    }
+
     /* floats by stable key */
     set_float_key(p,key,atof(val));
-
-    /* TODO: if(!strcmp(key,"state")) deserialize_all(p,val);  (preset save/restore) */
 }
 
 static int get_param(void *instance, const char *key, char *buf, int buf_len){
@@ -1064,7 +1143,16 @@ static int get_param(void *instance, const char *key, char *buf, int buf_len){
         }
     }
 
-    /* TODO: if(!strcmp(key,"state")) return serialize_all(p,buf,buf_len); */
+    /* full-state serialize (per-Set persistence) — CSV, round-trips with set_param("state") */
+    if(!strcmp(key,"state")){
+        int o=0;
+        for(int s=0;s<NUM_SLOTS;s++)
+            o+=snprintf(buf+o,buf_len-o,"%d,%.4f,%.4f,%.4f,",
+                p->slots[s].select,p->slots[s].amount,p->slots[s].macro,p->slots[s].drift);
+        o+=snprintf(buf+o,buf_len-o,"%.4f,%.4f,%d,%d",
+            p->mix,p->input_vol,p->fx_reorder,p->current_preset);
+        return o;
+    }
 
     return -1;   /* unknown key MUST be -1, never 0 */
 }
