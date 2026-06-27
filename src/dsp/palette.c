@@ -299,7 +299,7 @@ static void fx_drive(slot_dsp_t *s, float *l, float *r, int n,
         s->z1l += tc*(xl-s->z1l)+DENORM; s->z1r += tc*(xr-s->z1r)+DENORM;
         float ll = (tilt>=0.0f)? lerpf(xl,(xl-s->z1l)*2.0f,tilt) : lerpf(xl,s->z1l*1.6f,-tilt);
         float rr = (tilt>=0.0f)? lerpf(xr,(xr-s->z1r)*2.0f,tilt) : lerpf(xr,s->z1r*1.6f,-tilt);
-        l[i]=ll*comp; r[i]=rr*comp;
+        l[i]=lerpf(l[i],ll*comp,amount); r[i]=lerpf(r[i],rr*comp,amount); /* amount=0 → dry */
     }
 }
 
@@ -347,7 +347,7 @@ static void fx_fuzz(slot_dsp_t *s, float *l, float *r, int n,
             float y=sb_apply_dist(x,2) - sb_apply_dist(b,2);  /* super-boom Fuzz, DC-removed */
             float *z=ch?&s->z1r:&s->z1l;
             *z += tonec*(y-*z)+DENORM;
-            (ch?r:l)[i]=*z*0.8f;
+            (ch?r:l)[i]=lerpf((ch?r:l)[i],*z*0.8f,amount); /* amount=0 → dry */
         }
     }
 }
@@ -375,7 +375,7 @@ static void fx_howl(slot_dsp_t *s, float *l, float *r, int n,
             float v1=a1*(*ic1)+a2*v3;
             float v2=*ic2+a2*(*ic1)+a3*v3;
             *ic1=2.0f*v1-*ic1+DENORM; *ic2=2.0f*v2-*ic2+DENORM;
-            src[i]=tanhf(v1*voice)*0.9f;              /* v1 = bandpass */
+            src[i]=lerpf(src[i],tanhf(v1*voice)*0.9f,amount); /* v1 = bandpass; amount=0 → dry */
         }
     }
 }
@@ -399,7 +399,7 @@ static void fx_swell(slot_dsp_t *s, float *l, float *r, int n,
             if(a<thOff && *louder) *louder=0;
             if(*louder) *sw = *sw*(1.0f-speedOn)+speedOn;   /* Zeno → 1 */
             else      { *sw = *sw*(1.0f-speedOff); if(*sw<1e-15f)*sw=0.0f; } /* Zeno → 0, denormal floor */
-            (ch?r:l)[i]=x*(*sw);
+            (ch?r:l)[i]=lerpf(x,x*(*sw),amount); /* amount=0 → dry */
         }
     }
 }
@@ -511,7 +511,7 @@ static void fx_phaser(slot_dsp_t *s, float *l, float *r, int n,
                 ap[k]=x-coef*y; x=y;
             }
             *fbz=x;
-            (ch?r:l)[i]=lerpf((ch?r:l)[i],0.5f*((ch?r:l)[i]+x),clampf(0.3f+amount,0.0f,1.0f));
+            (ch?r:l)[i]=lerpf((ch?r:l)[i],0.5f*((ch?r:l)[i]+x),amount); /* amount=0 → dry */
         }
     }
 }
@@ -766,7 +766,7 @@ static void fx_squash(slot_dsp_t *s, float *l, float *r, int n,
         /* Pressure4 second-stage sin() overdrive */
         float br=fabsf(xl); br=(br>1.57079633f)?1.0f:sinf(br); xl=(xl>0)?br:-br;
         br=fabsf(xr);      br=(br>1.57079633f)?1.0f:sinf(br); xr=(xr>0)?br:-br;
-        l[i]=xl*comp; r[i]=xr*comp;                      /* level-matched output */
+        l[i]=lerpf(l[i],xl*comp,A); r[i]=lerpf(r[i],xr*comp,A); /* level-matched; amount=0 → dry */
         s->i1^=1;
     }
 }
@@ -1019,61 +1019,56 @@ typedef struct {
 
 #define NUM_PRESETS 50
 static const preset_t PRESETS[NUM_PRESETS] = {
-/*  name              fx1..4                                          amt              mac              drf            mix ivol ord */
-/* ── UTILITARIAN (1–16): clean, everyday ─────────────────────────────────────────────────────────────────────── */
-{"Init",          {PFX_OFF,PFX_OFF,PFX_OFF,PFX_OFF},               {0,0,0,0},       {0,0,0,0},       {0,0,0,0},     100,100,0},
-{"Delay + Verb",  {PFX_CASCADE,PFX_SPACE,PFX_OFF,PFX_OFF},         {50,45,0,0},     {45,55,0,0},     {12,8,0,0},    100,100,0},
-{"Tape Echo",     {PFX_REELS,PFX_OFF,PFX_OFF,PFX_OFF},             {50,0,0,0},      {45,0,0,0},      {18,0,0,0},    100,100,0},
-{"Concert Hall",  {PFX_SPACE,PFX_OFF,PFX_OFF,PFX_OFF},             {55,0,0,0},      {70,0,0,0},      {8,0,0,0},     100,100,0},
-{"Plate Shimmer", {PFX_BLOOM,PFX_OFF,PFX_OFF,PFX_OFF},             {50,0,0,0},      {55,0,0,0},      {10,0,0,0},    100,100,0},
-{"Doubler Width", {PFX_DOUBLER,PFX_OFF,PFX_OFF,PFX_OFF},           {55,0,0,0},      {40,0,0,0},      {12,0,0,0},    100,100,0},
-{"Slapback",      {PFX_DOUBLER,PFX_CASCADE,PFX_OFF,PFX_OFF},       {50,35,0,0},     {35,30,0,0},     {10,10,0,0},   100,100,0},
-{"Warm Drive",    {PFX_DRIVE,PFX_OFF,PFX_OFF,PFX_OFF},             {45,0,0,0},      {55,0,0,0},      {8,0,0,0},     100,100,0},
-{"Console Glue",  {PFX_SWEETEN,PFX_SQUASH,PFX_OFF,PFX_OFF},        {45,40,0,0},     {55,50,0,0},     {6,8,0,0},     100,100,0},
-{"Vibrato Verb",  {PFX_VIBRATO,PFX_SPACE,PFX_OFF,PFX_OFF},         {35,45,0,0},     {35,60,0,0},     {15,8,0,0},    100,100,0},
-{"Tape Slap",     {PFX_CASSETTE,PFX_CASCADE,PFX_OFF,PFX_OFF},      {45,40,0,0},     {45,35,0,0},     {20,10,0,0},   100,100,0},
-{"LP Sweep",      {PFX_FILTER,PFX_OFF,PFX_OFF,PFX_OFF},            {28,0,0,0},      {45,0,0,0},      {6,0,0,0},     100,100,0},
-{"HP Air",        {PFX_FILTER,PFX_SPACE,PFX_OFF,PFX_OFF},          {72,40,0,0},     {35,55,0,0},     {6,8,0,0},     100,100,0},
-{"Tremolo Pan",   {PFX_TREMOLO,PFX_OFF,PFX_OFF,PFX_OFF},           {45,0,0,0},      {45,0,0,0},      {60,0,0,0},    100,100,0},
-{"Octave Up",     {PFX_PITCH,PFX_SPACE,PFX_OFF,PFX_OFF},           {45,45,0,0},     {75,55,0,0},     {10,8,0,0},    100,100,0},
-{"Phaser Verb",   {PFX_PHASER,PFX_SPACE,PFX_OFF,PFX_OFF},          {45,45,0,0},     {45,55,0,0},     {12,8,0,0},    100,100,0},
-/* ── CHARACTER / MUSICAL (17–34): richer, colored ───────────────────────────────────────────────────────────── */
-{"Fuzz Phaze Vrb",{PFX_FUZZ,PFX_PHASER,PFX_SPACE,PFX_OFF},         {50,50,40,0},    {45,50,55,0},    {15,12,8,0},   100,95,0},
-{"West Coast",    {PFX_FOLD,PFX_FILTER,PFX_SPACE,PFX_OFF},         {50,35,40,0},    {50,50,55,0},    {12,8,8,0},    100,95,0},
-{"Howl Stab",     {PFX_HOWL,PFX_REELS,PFX_OFF,PFX_OFF},            {55,40,0,0},     {50,45,0,0},     {18,12,0,0},   100,95,0},
-{"Shimmer Drive", {PFX_DRIVE,PFX_BLOOM,PFX_OFF,PFX_OFF},           {40,55,0,0},     {55,70,0,0},     {8,12,0,0},    100,100,0},
-{"Swell Pad",     {PFX_SWELL,PFX_SPACE,PFX_BLOOM,PFX_OFF},         {60,45,45,0},    {50,65,65,0},    {8,8,12,0},    100,100,0},
-{"Pitch Cloud",   {PFX_PITCH,PFX_COLLAGE,PFX_SPACE,PFX_OFF},       {45,40,45,0},    {65,50,60,0},    {12,20,8,0},   100,100,0},
-{"Lo-fi Tape",    {PFX_CASSETTE,PFX_REELS,PFX_OFF,PFX_OFF},        {55,45,0,0},     {40,50,0,0},     {30,18,0,0},   100,100,0},
-{"Squash Drive",  {PFX_SQUASH,PFX_DRIVE,PFX_OFF,PFX_OFF},          {55,40,0,0},     {50,55,0,0},     {10,8,0,0},    100,100,0},
-{"Reverse Bloom", {PFX_REVERSE,PFX_BLOOM,PFX_OFF,PFX_OFF},         {50,50,0,0},     {45,65,0,0},     {12,12,0,0},   100,100,0},
-{"Fold Space",    {PFX_FOLD,PFX_SPACE,PFX_OFF,PFX_OFF},            {45,50,0,0},     {55,60,0,0},     {12,8,0,0},    100,95,0},
-{"Shift Bloom",   {PFX_SHIFT,PFX_BLOOM,PFX_OFF,PFX_OFF},           {40,55,0,0},     {58,70,0,0},     {12,12,0,0},   100,100,0},
-{"Dub Filter",    {PFX_FILTER,PFX_REELS,PFX_OFF,PFX_OFF},          {30,50,0,0},     {55,55,0,0},     {8,20,0,0},    100,100,0},
-{"Ambient Swell", {PFX_SWELL,PFX_BLOOM,PFX_OFF,PFX_OFF},           {65,55,0,0},     {50,72,0,0},     {8,15,0,0},    100,100,0},
-{"Vibe Drive Vrb",{PFX_VIBRATO,PFX_DRIVE,PFX_SPACE,PFX_OFF},       {35,40,45,0},    {35,55,55,0},    {15,8,8,0},    100,100,0},
-{"Tape Phaser",   {PFX_PHASER,PFX_CASSETTE,PFX_OFF,PFX_OFF},       {50,45,0,0},     {45,45,0,0},     {12,22,0,0},   100,100,0},
-{"Crush Verb",    {PFX_INTERFERENCE,PFX_SPACE,PFX_OFF,PFX_OFF},    {40,50,0,0},     {45,60,0,0},     {18,8,0,0},    100,100,0},
-{"Grain Hall",    {PFX_COLLAGE,PFX_SPACE,PFX_OFF,PFX_OFF},         {45,55,0,0},     {50,65,0,0},     {20,8,0,0},    100,100,0},
-{"Octave Drive",  {PFX_SHIFT,PFX_DRIVE,PFX_SPACE,PFX_OFF},         {35,40,45,0},    {60,55,55,0},    {10,8,8,0},    100,95,0},
-/* ── WEIRD (35–46): glitchy, unstable ───────────────────────────────────────────────────────────────────────── */
-{"Broken Radio",  {PFX_BROKEN,PFX_INTERFERENCE,PFX_OFF,PFX_OFF},   {45,45,0,0},     {40,45,0,0},     {25,30,0,0},   95,100,0},
-{"Freeze Reels",  {PFX_FREEZE,PFX_REELS,PFX_OFF,PFX_OFF},          {60,40,0,0},     {50,45,0,0},     {20,18,0,0},   100,100,0},
-{"Glitch Cloud",  {PFX_COLLAGE,PFX_FREEZE,PFX_SPACE,PFX_OFF},      {50,50,45,0},    {45,55,60,0},    {28,18,8,0},   100,100,0},
-{"Intf Freeze",   {PFX_INTERFERENCE,PFX_FREEZE,PFX_OFF,PFX_OFF},   {45,55,0,0},     {45,55,0,0},     {28,18,0,0},   100,100,0},
-{"Reverse Shift", {PFX_REVERSE,PFX_SHIFT,PFX_OFF,PFX_OFF},         {50,40,0,0},     {45,60,0,0},     {15,15,0,0},   100,100,0},
-{"Fold Fuzz",     {PFX_FOLD,PFX_FUZZ,PFX_OFF,PFX_OFF},             {45,40,0,0},     {55,45,0,0},     {15,18,0,0},   100,90,0},
-{"Broken Tape",   {PFX_BROKEN,PFX_CASSETTE,PFX_OFF,PFX_OFF},       {45,50,0,0},     {40,45,0,0},     {25,30,0,0},   100,100,0},
-{"Crush Bloom",   {PFX_INTERFERENCE,PFX_BLOOM,PFX_OFF,PFX_OFF},    {40,55,0,0},     {50,70,0,0},     {20,15,0,0},   100,100,0},
-{"Stutter Verb",  {PFX_COLLAGE,PFX_REVERSE,PFX_SPACE,PFX_OFF},     {50,45,45,0},    {45,50,60,0},    {28,15,8,0},   100,100,0},
-{"Howl Freeze",   {PFX_HOWL,PFX_FREEZE,PFX_OFF,PFX_OFF},           {50,55,0,0},     {55,50,0,0},     {20,18,0,0},   100,95,0},
-{"Warble Shift",  {PFX_CASSETTE,PFX_SHIFT,PFX_OFF,PFX_OFF},        {55,40,0,0},     {45,58,0,0},     {35,15,0,0},   100,100,0},
-{"Ghost Pitch",   {PFX_PITCH,PFX_FREEZE,PFX_BLOOM,PFX_OFF},        {45,55,50,0},    {70,50,70,0},    {15,18,12,0},  100,100,0},
-/* ── EXPERIMENTAL (47–50): full / extreme ───────────────────────────────────────────────────────────────────── */
-{"Full Chain",    {PFX_DRIVE,PFX_PHASER,PFX_REELS,PFX_SPACE},      {40,45,45,40},   {50,50,45,55},   {8,12,12,8},   100,95,0},
-{"Ambient Wash",  {PFX_SWELL,PFX_SHIFT,PFX_BLOOM,PFX_FREEZE},      {60,40,55,45},   {50,60,70,55},   {8,12,12,18},  100,100,0},
-{"Chaos Engine",  {PFX_FOLD,PFX_BROKEN,PFX_COLLAGE,PFX_FREEZE},    {45,45,50,50},   {50,45,50,55},   {15,25,25,18}, 95,90,0},
-{"Total Destroy", {PFX_FUZZ,PFX_INTERFERENCE,PFX_BROKEN,PFX_FREEZE},{50,45,45,50},  {45,45,40,55},   {20,28,28,20}, 90,90,0},
+{"Init",           {PFX_DRIVE,PFX_DOUBLER,PFX_CASCADE,PFX_FILTER},    {0,0,0,50}, {50,40,45,30}, {0,0,0,0}, 100,100,0},
+{"Delay + Verb",   {PFX_CASCADE,PFX_SPACE,PFX_VIBRATO,PFX_FREEZE},    {50,45,0,0}, {45,55,50,50}, {12,8,0,0}, 100,100,0},
+{"Tape Echo",      {PFX_REELS,PFX_SHIFT,PFX_SWELL,PFX_COLLAGE},       {50,0,0,0}, {45,50,50,50}, {18,0,0,0}, 100,100,0},
+{"Concert Hall",   {PFX_SPACE,PFX_CASSETTE,PFX_HOWL,PFX_PITCH},       {55,0,0,0}, {70,50,50,50}, {8,0,0,0}, 100,100,0},
+{"Plate Shimmer",  {PFX_BLOOM,PFX_SQUASH,PFX_BROKEN,PFX_INTERFERENCE},{50,0,0,0}, {55,50,50,50}, {10,0,0,0}, 100,100,0},
+{"Doubler Width",  {PFX_DOUBLER,PFX_TREMOLO,PFX_SPACE,PFX_REELS},     {55,0,0,0}, {40,50,50,50}, {12,0,0,0}, 100,100,0},
+{"Slapback",       {PFX_DOUBLER,PFX_CASCADE,PFX_FREEZE,PFX_PHASER},   {50,35,0,0}, {35,30,50,50}, {10,10,0,0}, 100,100,0},
+{"Warm Drive",     {PFX_DRIVE,PFX_SWELL,PFX_COLLAGE,PFX_FUZZ},        {45,0,0,0}, {55,50,50,50}, {8,0,0,0}, 100,100,0},
+{"Console Glue",   {PFX_SWEETEN,PFX_SQUASH,PFX_HOWL,PFX_PITCH},       {45,40,0,0}, {55,50,50,50}, {6,8,0,0}, 100,100,0},
+{"Vibrato Verb",   {PFX_VIBRATO,PFX_SPACE,PFX_BROKEN,PFX_INTERFERENCE},{35,45,0,0}, {35,60,50,50}, {15,8,0,0}, 100,100,0},
+{"Tape Slap",      {PFX_CASSETTE,PFX_CASCADE,PFX_TREMOLO,PFX_SPACE},  {45,40,0,0}, {45,35,50,50}, {20,10,0,0}, 100,100,0},
+{"LP Sweep",       {PFX_FILTER,PFX_PHASER,PFX_BLOOM,PFX_CASCADE},     {28,0,0,0}, {45,50,50,50}, {6,0,0,0}, 100,100,0},
+{"HP Air",         {PFX_FILTER,PFX_SPACE,PFX_COLLAGE,PFX_FUZZ},       {72,40,0,0}, {35,55,50,50}, {6,8,0,0}, 100,100,0},
+{"Tremolo Pan",    {PFX_TREMOLO,PFX_PITCH,PFX_SWEETEN,PFX_FILTER},    {45,0,0,50}, {45,50,50,30}, {60,0,0,0}, 100,100,0},
+{"Octave Up",      {PFX_PITCH,PFX_SPACE,PFX_INTERFERENCE,PFX_FOLD},   {45,45,0,0}, {75,55,50,50}, {10,8,0,0}, 100,100,0},
+{"Phaser Verb",    {PFX_PHASER,PFX_SPACE,PFX_REELS,PFX_VIBRATO},      {45,45,0,0}, {45,55,50,50}, {12,8,0,0}, 100,100,0},
+{"Fuzz Phaze Vrb", {PFX_FUZZ,PFX_PHASER,PFX_SPACE,PFX_BLOOM},         {50,50,40,0}, {45,50,55,50}, {15,12,8,0}, 100,95,0},
+{"West Coast",     {PFX_FOLD,PFX_FILTER,PFX_SPACE,PFX_FUZZ},          {50,35,40,0}, {50,50,55,50}, {12,8,8,0}, 100,95,0},
+{"Howl Stab",      {PFX_HOWL,PFX_REELS,PFX_SWEETEN,PFX_FILTER},       {55,40,0,50}, {50,45,50,30}, {18,12,0,0}, 100,95,0},
+{"Shimmer Drive",  {PFX_DRIVE,PFX_BLOOM,PFX_FOLD,PFX_DOUBLER},        {40,55,0,0}, {55,70,50,50}, {8,12,0,0}, 100,100,0},
+{"Swell Pad",      {PFX_SWELL,PFX_SPACE,PFX_BLOOM,PFX_REELS},         {60,45,45,0}, {50,65,65,50}, {8,8,12,0}, 100,100,0},
+{"Pitch Cloud",    {PFX_PITCH,PFX_COLLAGE,PFX_SPACE,PFX_CASCADE},     {45,40,45,0}, {65,50,60,50}, {12,20,8,0}, 100,100,0},
+{"Lo-fi Tape",     {PFX_CASSETTE,PFX_REELS,PFX_REVERSE,PFX_HOWL},     {55,45,0,0}, {40,50,50,50}, {30,18,0,0}, 100,100,0},
+{"Squash Drive",   {PFX_SQUASH,PFX_DRIVE,PFX_FILTER,PFX_BROKEN},      {55,40,50,0}, {50,55,30,50}, {10,8,0,0}, 100,100,0},
+{"Reverse Bloom",  {PFX_REVERSE,PFX_BLOOM,PFX_DRIVE,PFX_DOUBLER},     {50,50,0,0}, {45,65,50,50}, {12,12,0,0}, 100,100,0},
+{"Fold Space",     {PFX_FOLD,PFX_SPACE,PFX_VIBRATO,PFX_FREEZE},       {45,50,0,0}, {55,60,50,50}, {12,8,0,0}, 100,95,0},
+{"Shift Bloom",    {PFX_SHIFT,PFX_BLOOM,PFX_SWELL,PFX_COLLAGE},       {40,55,0,0}, {58,70,50,50}, {12,12,0,0}, 100,100,0},
+{"Dub Filter",     {PFX_FILTER,PFX_REELS,PFX_CASSETTE,PFX_HOWL},      {30,50,0,0}, {55,55,50,50}, {8,20,0,0}, 100,100,0},
+{"Ambient Swell",  {PFX_SWELL,PFX_BLOOM,PFX_SQUASH,PFX_BROKEN},       {65,55,0,0}, {50,72,50,50}, {8,15,0,0}, 100,100,0},
+{"Vibe Drive Vrb", {PFX_VIBRATO,PFX_DRIVE,PFX_SPACE,PFX_DOUBLER},     {35,40,45,0}, {35,55,55,50}, {15,8,8,0}, 100,100,0},
+{"Tape Phaser",    {PFX_PHASER,PFX_CASSETTE,PFX_FREEZE,PFX_BLOOM},    {50,45,0,0}, {45,45,50,50}, {12,22,0,0}, 100,100,0},
+{"Crush Verb",     {PFX_INTERFERENCE,PFX_SPACE,PFX_SWELL,PFX_COLLAGE},{40,50,0,0}, {45,60,50,50}, {18,8,0,0}, 100,100,0},
+{"Grain Hall",     {PFX_COLLAGE,PFX_SPACE,PFX_HOWL,PFX_PITCH},        {45,55,0,0}, {50,65,50,50}, {20,8,0,0}, 100,100,0},
+{"Octave Drive",   {PFX_SHIFT,PFX_DRIVE,PFX_SPACE,PFX_BROKEN},        {35,40,45,0}, {60,55,55,50}, {10,8,8,0}, 100,95,0},
+{"Broken Radio",   {PFX_BROKEN,PFX_INTERFERENCE,PFX_TREMOLO,PFX_SPACE},{45,45,0,0}, {40,45,50,50}, {25,30,0,0}, 95,100,0},
+{"Freeze Reels",   {PFX_FREEZE,PFX_REELS,PFX_PHASER,PFX_BLOOM},       {60,40,0,0}, {50,45,50,50}, {20,18,0,0}, 100,100,0},
+{"Glitch Cloud",   {PFX_COLLAGE,PFX_FREEZE,PFX_SPACE,PFX_FUZZ},       {50,50,45,0}, {45,55,60,50}, {28,18,8,0}, 100,100,0},
+{"Intf Freeze",    {PFX_INTERFERENCE,PFX_FREEZE,PFX_PITCH,PFX_SWEETEN},{45,55,0,0}, {45,55,50,50}, {28,18,0,0}, 100,100,0},
+{"Reverse Shift",  {PFX_REVERSE,PFX_SHIFT,PFX_INTERFERENCE,PFX_FOLD}, {50,40,0,0}, {45,60,50,50}, {15,15,0,0}, 100,100,0},
+{"Fold Fuzz",      {PFX_FOLD,PFX_FUZZ,PFX_SPACE,PFX_REELS},           {45,40,0,0}, {55,45,50,50}, {15,18,0,0}, 100,90,0},
+{"Broken Tape",    {PFX_BROKEN,PFX_CASSETTE,PFX_BLOOM,PFX_CASCADE},   {45,50,0,0}, {40,45,50,50}, {25,30,0,0}, 100,100,0},
+{"Crush Bloom",    {PFX_INTERFERENCE,PFX_BLOOM,PFX_FUZZ,PFX_REVERSE}, {40,55,0,0}, {50,70,50,50}, {20,15,0,0}, 100,100,0},
+{"Stutter Verb",   {PFX_COLLAGE,PFX_REVERSE,PFX_SPACE,PFX_SWEETEN},   {50,45,45,0}, {45,50,60,50}, {28,15,8,0}, 100,100,0},
+{"Howl Freeze",    {PFX_HOWL,PFX_FREEZE,PFX_FOLD,PFX_DRIVE},          {50,55,0,0}, {55,50,50,50}, {20,18,0,0}, 100,95,0},
+{"Warble Shift",   {PFX_CASSETTE,PFX_SHIFT,PFX_REELS,PFX_VIBRATO},    {55,40,0,0}, {45,58,50,50}, {35,15,0,0}, 100,100,0},
+{"Ghost Pitch",    {PFX_PITCH,PFX_FREEZE,PFX_BLOOM,PFX_CASCADE},      {45,55,50,0}, {70,50,70,50}, {15,18,12,0}, 100,100,0},
+{"Full Chain",     {PFX_DRIVE,PFX_PHASER,PFX_REELS,PFX_SPACE},        {40,45,45,40}, {50,50,45,55}, {8,12,12,8}, 100,95,0},
+{"Ambient Wash",   {PFX_SWELL,PFX_SHIFT,PFX_BLOOM,PFX_FREEZE},        {60,40,55,45}, {50,60,70,55}, {8,12,12,18}, 100,100,0},
+{"Chaos Engine",   {PFX_FOLD,PFX_BROKEN,PFX_COLLAGE,PFX_FREEZE},      {45,45,50,50}, {50,45,50,55}, {15,25,25,18}, 95,90,0},
+{"Total Destroy",  {PFX_FUZZ,PFX_INTERFERENCE,PFX_BROKEN,PFX_FREEZE}, {50,45,45,50}, {45,45,40,55}, {20,28,28,20}, 90,90,0},
 };
 
 /* Apply a factory preset: heavy-aware select for all 4 slots, then snap params. */
