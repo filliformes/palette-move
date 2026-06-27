@@ -45,6 +45,10 @@
             {
               "level": "FX34",
               "label": "FX 3&4"
+            },
+            {
+              "level": "Global",
+              "label": "GLOBAL"
             }
           ]
         },
@@ -139,6 +143,21 @@
             "fx4_amount",
             "fx4_macro",
             "fx4_drift"
+          ]
+        },
+        "Global": {
+          "name": "GLOBAL",
+          "knobs": [
+            "feedback",
+            "tempo_src",
+            "tempo_bpm",
+            "time_div"
+          ],
+          "params": [
+            "feedback",
+            "tempo_src",
+            "tempo_bpm",
+            "time_div"
           ]
         }
       }
@@ -515,6 +534,53 @@
         "options": [
           "0",
           "1"
+        ]
+      },
+      {
+        "key": "feedback",
+        "name": "Feedback",
+        "type": "float",
+        "min": 0,
+        "max": 1,
+        "step": 0.01
+      },
+      {
+        "key": "tempo_src",
+        "name": "Tempo Src",
+        "type": "enum",
+        "options": [
+          "Move",
+          "Int"
+        ]
+      },
+      {
+        "key": "tempo_bpm",
+        "name": "Tempo",
+        "type": "int",
+        "min": 10,
+        "max": 500,
+        "step": 1
+      },
+      {
+        "key": "time_div",
+        "name": "Time Div",
+        "type": "enum",
+        "options": [
+          "Free",
+          "1/1",
+          "1/2",
+          "1/2T",
+          "1/2D",
+          "1/4",
+          "1/4T",
+          "1/4D",
+          "1/8",
+          "1/8T",
+          "1/8D",
+          "1/16",
+          "1/16T",
+          "1/16D",
+          "1/32"
         ]
       }
     ]
