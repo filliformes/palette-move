@@ -217,12 +217,6 @@ static inline float dlr(const float *b,int wp,float d){
     int i0=(int)rp; float fr=rp-(float)i0; int i1=i0+1; if(i1>=MAX_DELAY) i1=0;
     return b[i0]+(b[i1]-b[i0])*fr;
 }
-/* triangle wavefolder: reflect x into [-1,1] (period 4) */
-static inline float trifold(float x){
-    x = x - 4.0f*floorf((x+2.0f)*0.25f);          /* wrap to [-2,2) */
-    if(x>1.0f) x=2.0f-x; else if(x<-1.0f) x=-2.0f-x;
-    return x;
-}
 /* slow musical random-walk in [-1,1] stored in *st (drift LFO) */
 static inline float wander(float *st,uint32_t *seed,float speed){
     *st += speed*((frand(seed)-0.5f)*2.0f - *st);
@@ -373,7 +367,7 @@ static void fx_swell(slot_dsp_t *s, float *l, float *r, int n,
             if(a>thOn && !*louder) *louder=1;
             if(a<thOff && *louder) *louder=0;
             if(*louder) *sw = *sw*(1.0f-speedOn)+speedOn;   /* Zeno → 1 */
-            else        *sw = *sw*(1.0f-speedOff);          /* Zeno → 0 */
+            else      { *sw = *sw*(1.0f-speedOff); if(*sw<1e-15f)*sw=0.0f; } /* Zeno → 0, denormal floor */
             (ch?r:l)[i]=x*(*sw);
         }
     }
@@ -772,9 +766,6 @@ static void fx_broken(slot_dsp_t *s, float *l, float *r, int n,
         /* sawtooth-ish motor slowdown: pitch dips then snaps back */
         float dip=amount*(0.5f-0.5f*cosf(s->lfo*TWO_PI));
         float vs=1.0f-dip*0.6f;                       /* varispeed read rate */
-        s->f2+=vs;                                      /* moving read head */
-        float d=base+ (s->wp - (int)s->f2);            /* not used directly; keep simple */
-        (void)d;
         s->dl_l[s->wp]=l[i]; s->dl_r[s->wp]=r[i];
         float rd=base*(2.0f-vs);                        /* slow read = lower pitch */
         float xL=dlr(s->dl_l,s->wp,rd), xR=dlr(s->dl_r,s->wp,rd);
@@ -829,10 +820,9 @@ static void fx_interference(slot_dsp_t *s, float *l, float *r, int n,
             if(x>0.0f) x= logf(1.0f+255.0f*fabsf(x))/L256;
             else if(x<0.0f) x=-logf(1.0f+255.0f*fabsf(x))/L256;
             x=temp*hard + x*(1.0f-hard);
-            if(s->f3>0.0005f){                          /* bit-depth quantize */
-                float t2=x;
-                if(x>0.0f){ while(t2>0.0f) t2-=s->f3; x-=t2; }
-                else if(x<0.0f){ while(t2<0.0f) t2+=s->f3; x-=t2; }
+            if(s->f3>0.0005f){                          /* bit-depth quantize (O(1)) */
+                if(x>0.0f)      x=ceilf (x/s->f3)*s->f3;
+                else if(x<0.0f) x=floorf(x/s->f3)*s->f3;
             }
             x=lerpf(x, x*sinf(s->lfo*TWO_PI), macro*0.4f);  /* ring-mod radio */
             if(drift>0.0f && frand(&s->seed)<drift*0.04f) x+=(frand(&s->seed)-0.5f)*drift;
