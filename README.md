@@ -125,8 +125,9 @@ Drift**, all across the four slots.
 ./scripts/install.sh        # SCP to ableton@move.local, then power-cycle the Move
 ```
 
-Or unpack the release tarball into `/data/UserData/schwung/modules/audio_fx/palette/` and
-power-cycle the Move.
+**Just want to test it on your Move (no build)?** Grab `palette-module.tar.gz` from the
+[Releases](https://github.com/filliformes/palette-move/releases) page and follow
+**[INSTALL.md](INSTALL.md)** — a 30-second SSH side-load, no Docker or module store needed.
 
 **Architecture:** host + 21 pure-C effects in `src/dsp/palette.c`; the three Clouds effects in
 `src/dsp/fx_clouds.cc`; the spectral Freeze in `src/dsp/fx_spectral.cc`; authentic Warps lookup
