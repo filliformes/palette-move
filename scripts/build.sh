@@ -20,7 +20,7 @@ CID=$(MSYS_NO_PATHCONV=1 docker create -w /build "$IMAGE" bash -c '
     dos2unix /build/src/dsp/*.c /build/src/dsp/*.cc /build/src/dsp/*.cpp 2>/dev/null || true
     mkdir -p /build/dist/palette /build/obj
     CFLAGS="-O2 -fPIC -ffast-math -I/build/src/dsp"
-    CXXFLAGS="-O2 -fPIC -ffast-math -std=c++11 -fno-exceptions -fno-rtti -I/build/src/dsp -I/build/vendor/clouds_engine"
+    CXXFLAGS="-O2 -fPIC -ffast-math -std=c++11 -fno-exceptions -fno-rtti -I/build/src/dsp -I/build/vendor/clouds_engine -I/build/vendor/signalsmith"
     OBJS=()
     for f in /build/src/dsp/*.c; do
         o="/build/obj/$(basename "${f%.c}").o"

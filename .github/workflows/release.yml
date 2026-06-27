@@ -36,7 +36,7 @@ jobs:
             dos2unix /repo/src/dsp/*.c /repo/src/dsp/*.cc /repo/src/dsp/*.cpp 2>/dev/null || true
             mkdir -p /repo/dist/palette /repo/obj
             CFLAGS="-O2 -fPIC -ffast-math -I/repo/src/dsp"
-            CXXFLAGS="-O2 -fPIC -ffast-math -std=c++11 -fno-exceptions -fno-rtti -I/repo/src/dsp -I/repo/vendor/clouds_engine"
+            CXXFLAGS="-O2 -fPIC -ffast-math -std=c++11 -fno-exceptions -fno-rtti -I/repo/src/dsp -I/repo/vendor/clouds_engine -I/repo/vendor/signalsmith"
             OBJS=()
             for f in /repo/src/dsp/*.c; do
               o="/repo/obj/$(basename "${f%.c}").o"

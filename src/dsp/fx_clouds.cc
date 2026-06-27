@@ -26,6 +26,13 @@ using namespace clouds;
 
 enum { FX_SPACE = 15, FX_BLOOM = 18, FX_FREEZE = 24 };
 
+/* FREEZE lives in fx_spectral.cc (Signalsmith FFT) — delegated from here so
+ * palette.c keeps a single heavy-dispatch interface. */
+extern "C" void *pfx_spectral_alloc(float sr);
+extern "C" void  pfx_spectral_free(void *h);
+extern "C" void  pfx_spectral_process(void *h, float *l, float *r, int n,
+                                      float amount, float macro, float drift);
+
 #define CLD_SR     44100.0f
 #define CLD_MAXBLK 128
 #ifndef CLD_TWO_PI
@@ -130,76 +137,15 @@ static void bloom_process(BloomState *st, float *l, float *r, int n,
     }
 }
 
-/* ── FREEZE ────────────────────────────────────────────────────────────────── */
-#define FRZ_LEN   66150                                     /* 1.5 s stereo capture */
-#define FRZ_GR    4                                         /* overlapping grains */
-struct FreezeState {
-    int      kind;
-    float   *bl, *br;                                       /* capture buffers */
-    int      wp;                                            /* write ptr (live) */
-    int      frozen;                                        /* 0 = capturing, 1 = held */
-    float    gstart[FRZ_GR];                                /* per-grain start index */
-    float    gph[FRZ_GR];                                   /* per-grain window phase */
-    float    gsz;                                           /* grain size (samples) */
-    uint32_t seed;
-};
-static FreezeState *freeze_new(){
-    FreezeState *st = new(std::nothrow) FreezeState;
-    if(!st) return NULL;
-    st->kind=FX_FREEZE;
-    st->bl=(float*)calloc(FRZ_LEN,sizeof(float));
-    st->br=(float*)calloc(FRZ_LEN,sizeof(float));
-    if(!st->bl||!st->br){ free(st->bl); free(st->br); delete st; return NULL; }
-    st->wp=0; st->frozen=0; st->gsz=4096.0f; st->seed=0x55aa1234u;
-    for(int g=0;g<FRZ_GR;g++){
-        st->gstart[g]=(float)((g*FRZ_LEN)/FRZ_GR);
-        st->gph[g]=(float)g*(st->gsz/(float)FRZ_GR);        /* staggered for overlap */
-    }
-    return st;
-}
-static void freeze_process(FreezeState *st, float *l, float *r, int n,
-                           float amount, float macro, float drift){
-    int freeze_on = amount > 0.02f;
-    /* grain size from macro = spectral blur (bigger = smoother/smeary) */
-    st->gsz = 1024.0f + macro*macro*12000.0f;
-    if(st->gsz > (float)FRZ_LEN*0.5f) st->gsz=(float)FRZ_LEN*0.5f;
-    for(int i=0;i<n;i++){
-        if(!freeze_on){
-            st->bl[st->wp]=l[i]; st->br[st->wp]=r[i];       /* capture most recent 1.5 s */
-            st->wp=(st->wp+1)%FRZ_LEN;
-            st->frozen=0;
-            continue;
-        }
-        if(!st->frozen){ st->frozen=1; }                    /* hold current buffer */
-        /* sum FRZ_GR Hann-windowed grains looping over the frozen buffer */
-        float sl=0.0f, sr=0.0f, wsum=0.0f;
-        for(int g=0; g<FRZ_GR; g++){
-            float ph=st->gph[g];
-            float w=0.5f-0.5f*cosf(CLD_TWO_PI*ph/st->gsz);  /* Hann */
-            int idx=(int)(st->gstart[g]+ph); idx%=FRZ_LEN; if(idx<0) idx+=FRZ_LEN;
-            sl+=st->bl[idx]*w; sr+=st->br[idx]*w; wsum+=w;
-            st->gph[g]+=1.0f;
-            if(st->gph[g]>=st->gsz){                          /* relaunch (drifted start) */
-                st->gph[g]-=st->gsz;
-                float jit=(drift>0.0f)? (crandf(&st->seed)-0.5f)*drift*(float)FRZ_LEN*0.5f : 0.0f;
-                float base=(float)((g*FRZ_LEN)/FRZ_GR)+jit;
-                while(base<0)base+=FRZ_LEN; while(base>=FRZ_LEN)base-=FRZ_LEN;
-                st->gstart[g]=base;
-            }
-        }
-        float inv = wsum>0.001f ? 1.0f/wsum : 1.0f;
-        sl*=inv*2.0f; sr*=inv*2.0f;                         /* COLA-ish normalize */
-        l[i]=clerp(l[i],sl,amount); r[i]=clerp(r[i],sr,amount);
-    }
-}
+/* FREEZE is implemented in fx_spectral.cc (Signalsmith FFT) and reached through
+ * the heavy dispatch below — its state also begins with `kind == FX_FREEZE`. */
 
 /* ── extern "C" interface (called from palette.c) ────────────────────────────── */
 extern "C" void *pfx_clouds_alloc(int fx_id, float sr){
-    (void)sr;
     switch(fx_id){
         case FX_SPACE:  return (void*)space_new();
         case FX_BLOOM:  return (void*)bloom_new();
-        case FX_FREEZE: return (void*)freeze_new();
+        case FX_FREEZE: return pfx_spectral_alloc(sr);
         default:        return NULL;
     }
 }
@@ -209,7 +155,7 @@ extern "C" void pfx_clouds_free(void *heavy){
     switch(h->kind){
         case FX_SPACE:  delete (SpaceState*)heavy; break;
         case FX_BLOOM:  delete (BloomState*)heavy; break;
-        case FX_FREEZE: { FreezeState *f=(FreezeState*)heavy; free(f->bl); free(f->br); delete f; break; }
+        case FX_FREEZE: pfx_spectral_free(heavy); break;
         default: break;
     }
 }
@@ -219,7 +165,7 @@ extern "C" void pfx_clouds_process(int fx_id, void *heavy, float *l, float *r, i
     switch(fx_id){
         case FX_SPACE:  space_process ((SpaceState*)heavy, l,r,n,amount,macro,drift); break;
         case FX_BLOOM:  bloom_process ((BloomState*)heavy, l,r,n,amount,macro,drift); break;
-        case FX_FREEZE: freeze_process((FreezeState*)heavy,l,r,n,amount,macro,drift); break;
+        case FX_FREEZE: pfx_spectral_process(heavy,l,r,n,amount,macro,drift); break;
         default: break;
     }
 }
