@@ -227,6 +227,33 @@ static inline float wander(float *st,uint32_t *seed,float speed){
     return *st;
 }
 
+/* ── Sibling kernels (Filliformes, MIT) — extracted verbatim from shipped plugins ──
+ * sb_tanh: super-boom-move Padé tanh.  delay_saturate: krautdrums-move feedback
+ * saturator w/ DC removal.  tape_cubic/tape_asym: mello-move apply_tape_stage. */
+static inline float sb_tanh(float x){                       /* super-boom-move */
+    if(x>3.0f) return 1.0f; if(x<-3.0f) return -1.0f;
+    float x2=x*x; return x*(27.0f+x2)/(27.0f+9.0f*x2);
+}
+static inline float sb_apply_dist(float x,int mode){        /* super-boom apply_dist */
+    switch(mode){
+        case 0: return sinf(clampf(x,-1.57f,1.57f));            /* Boost */
+        case 1: return (x>0.0f)? sb_tanh(x) : (x*0.55f);       /* Tube  */
+        case 2: return clampf(x*1.4f,-0.85f,0.85f);            /* Fuzz  */
+        default: return x;
+    }
+}
+static inline float delay_saturate(float x,float drive,float asym){ /* krautdrums-move */
+    float clipped=sb_tanh(x*drive+asym);
+    return (clipped - sb_tanh(asym))/drive;
+}
+static inline float tape_cubic(float x,float drive){        /* mello-move */
+    float y=x*drive; if(y>1.5f) return 1.0f; if(y<-1.5f) return -1.0f;
+    return y - y*y*y*(1.0f/6.75f);
+}
+static inline float tape_asym(float x,float drive,float asym){ /* mello-move */
+    return sb_tanh(x*drive+asym)-sb_tanh(asym);
+}
+
 static void fx_passthrough(slot_dsp_t *s, float *l, float *r, int n,
                            float amount, float macro, float drift){
     (void)s;(void)l;(void)r;(void)n;(void)amount;(void)macro;(void)drift;
@@ -234,8 +261,8 @@ static void fx_passthrough(slot_dsp_t *s, float *l, float *r, int n,
 
 /* ── CHARACTER ─────────────────────────────────────────────────────────────── */
 
-/* DRIVE — tube-ish overdrive (super-boom sb_tanh/Tube voicing). amount=drive,
- * macro=tone tilt (dark↔bright), drift=slow bias wander. */
+/* DRIVE — tube-ish overdrive. Uses super-boom-move sb_apply_dist Tube voicing
+ * (asymmetric Padé tanh). amount=drive, macro=tone tilt, drift=slow bias wander. */
 static void fx_drive(slot_dsp_t *s, float *l, float *r, int n,
                      float amount, float macro, float drift){
     float g    = 1.0f + amount*amount*23.0f;        /* quadratic: fine low end */
@@ -244,7 +271,7 @@ static void fx_drive(slot_dsp_t *s, float *l, float *r, int n,
     float tc   = 0.18f;                              /* tilt one-pole coeff */
     for(int i=0;i<n;i++){
         float bias = drift>0.0f ? wander(&s->f1,&s->seed,0.0006f)*drift*0.12f : 0.0f;
-        float xl=tanhf(l[i]*g+bias), xr=tanhf(r[i]*g+bias);
+        float xl=sb_apply_dist(l[i]*g+bias,1), xr=sb_apply_dist(r[i]*g+bias,1); /* Tube */
         s->z1l += tc*(xl-s->z1l)+DENORM; s->z1r += tc*(xr-s->z1r)+DENORM;
         float ll = (tilt>=0.0f)? lerpf(xl,(xl-s->z1l)*2.0f,tilt) : lerpf(xl,s->z1l*1.6f,-tilt);
         float rr = (tilt>=0.0f)? lerpf(xr,(xr-s->z1r)*2.0f,tilt) : lerpf(xr,s->z1r*1.6f,-tilt);
@@ -285,11 +312,10 @@ static void fx_fuzz(slot_dsp_t *s, float *l, float *r, int n,
         float b=bias + (drift>0.0f? wander(&s->f1,&s->seed,0.002f)*drift*0.4f:0.0f);
         for(int ch=0;ch<2;ch++){
             float x=(ch?r:l)[i]*g + b;
-            float y=x/(1.0f+fabsf(x));               /* asym soft clip */
-            y=tanhf(y*1.6f)-tanhf(b);                /* remove DC from bias */
+            float y=sb_apply_dist(x,2) - sb_apply_dist(b,2);  /* super-boom Fuzz, DC-removed */
             float *z=ch?&s->z1r:&s->z1l;
             *z += tonec*(y-*z)+DENORM;
-            (ch?r:l)[i]=*z*0.7f;
+            (ch?r:l)[i]=*z*0.8f;
         }
     }
 }
@@ -509,8 +535,9 @@ static void delay_core(slot_dsp_t *s, float *l, float *r, int n,
         /* 2-pole LP darkening in the feedback */
         s->z1l+=lp_amt*(tapL-s->z1l)+DENORM; s->z2l+=lp_amt*(s->z1l-s->z2l)+DENORM;
         s->z1r+=lp_amt*(tapR-s->z1r)+DENORM; s->z2r+=lp_amt*(s->z1r-s->z2r)+DENORM;
-        float fl=s->z2l*fb, fr=s->z2r*fb;
-        fl=fl/(1.0f+fabsf(fl*0.7f)); fr=fr/(1.0f+fabsf(fr*0.7f)); /* soft sat */
+        /* krautdrums-move delay_saturate in the feedback (tanh drive + asym, DC-removed) */
+        float fl=delay_saturate(s->z2l*fb, 1.5f, 0.02f);
+        float fr=delay_saturate(s->z2r*fb, 1.5f, 0.02f);
         s->dl_l[s->wp]=l[i]+fl; s->dl_r[s->wp]=r[i]+fr;
         s->wp=(s->wp+1)%MAX_DELAY;
         l[i]=l[i]+tapL*0.9f; r[i]=r[i]+tapR*0.9f;
@@ -654,8 +681,9 @@ static void fx_cassette(slot_dsp_t *s, float *l, float *r, int n,
         s->dl_l[s->wp]=l[i]; s->dl_r[s->wp]=r[i];
         float xL=dlr(s->dl_l,s->wp,d), xR=dlr(s->dl_r,s->wp,d);
         s->wp=(s->wp+1)%MAX_DELAY;
-        /* tape sat (asym cubic) + HF rolloff */
-        xL=xL-0.16f*xL*xL*xL; xR=xR-0.16f*xR*xR*xR;
+        /* mello-move tape sat: cubic + asymmetric 2nd-harmonic warmth + HF rolloff */
+        xL=tape_cubic(xL,1.0f+amount*0.6f); xL=tape_asym(xL,1.0f,0.12f*amount);
+        xR=tape_cubic(xR,1.0f+amount*0.6f); xR=tape_asym(xR,1.0f,0.12f*amount);
         s->z1l+=roll*(xL-s->z1l)+DENORM; s->z1r+=roll*(xR-s->z1r)+DENORM;
         float nz=hiss*((frand(&s->seed)-0.5f)*2.0f);
         l[i]=lerpf(l[i],s->z1l+nz,amount); r[i]=lerpf(r[i],s->z1r+nz,amount);
