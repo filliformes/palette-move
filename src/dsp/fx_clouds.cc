@@ -24,7 +24,7 @@
 
 using namespace clouds;
 
-enum { FX_SPACE = 15, FX_BLOOM = 18, FX_FREEZE = 24 };
+enum { FX_SPACE = 17, FX_BLOOM = 18, FX_FREEZE = 24 };  /* MUST match palette.c PFX_* */
 
 /* FREEZE lives in fx_spectral.cc (Signalsmith FFT) — delegated from here so
  * palette.c keeps a single heavy-dispatch interface. */
@@ -66,15 +66,23 @@ static SpaceState *space_new(){
 }
 static void space_process(SpaceState *st, float *l, float *r, int n,
                           float amount, float macro, float drift){
-    st->verb.set_amount(cclampf(amount,0.0f,1.0f));
-    st->verb.set_time(0.5f + macro*0.49f);                 /* size / decay */
-    st->verb.set_diffusion(cclampf(0.6f + drift*0.12f,0.0f,0.9f));
+    st->verb.set_amount(1.0f);                              /* fully wet internally; mix outside */
+    st->verb.set_time(0.25f + macro*0.70f);                 /* small at macro=0 → bigger */
+    st->verb.set_diffusion(cclampf(0.5f + macro*0.3f + drift*0.1f,0.0f,0.9f));
     st->verb.set_lp(cclampf(0.7f - drift*0.25f,0.2f,0.95f));/* slow tone wander */
     FloatFrame fr[CLD_MAXBLK];
     if(n>CLD_MAXBLK) n=CLD_MAXBLK;
-    for(int i=0;i<n;i++){ fr[i].l=l[i]; fr[i].r=r[i]; }
+    float dryL[CLD_MAXBLK], dryR[CLD_MAXBLK];
+    for(int i=0;i<n;i++){ dryL[i]=l[i]; dryR[i]=r[i]; fr[i].l=l[i]; fr[i].r=r[i]; }
     st->verb.Process(fr, (size_t)n);
-    for(int i=0;i<n;i++){ l[i]=fr[i].l; r[i]=fr[i].r; }
+    float wet=cclampf(amount,0.0f,1.0f);
+    for(int i=0;i<n;i++){
+        /* cross-bleed guarantees BOTH channels carry the tail (no single-side reverb) */
+        float wl=fr[i].l*0.7f + fr[i].r*0.3f;
+        float wr=fr[i].r*0.7f + fr[i].l*0.3f;
+        l[i]=clerp(dryL[i], wl, wet);                       /* amount=0 → dry */
+        r[i]=clerp(dryR[i], wr, wet);
+    }
 }
 
 /* ── BLOOM ─────────────────────────────────────────────────────────────────── */
@@ -132,8 +140,9 @@ static void bloom_process(BloomState *st, float *l, float *r, int n,
         st->shl[st->shwp]=wl; st->shr[st->shwp]=wr;
         st->shwp=(st->shwp+1)%BLOOM_SH;
         float wetL=fr[i].l + oL*amount, wetR=fr[i].r + oR*amount;
-        l[i]=clerp(l[i],wetL,cclampf(amount+0.2f,0.0f,1.0f));
-        r[i]=clerp(r[i],wetR,cclampf(amount+0.2f,0.0f,1.0f));
+        float mxl=wetL*0.7f+wetR*0.3f, mxr=wetR*0.7f+wetL*0.3f;  /* stereo-safe */
+        l[i]=clerp(l[i],mxl,amount);         /* amount=0 → dry */
+        r[i]=clerp(r[i],mxr,amount);
     }
 }
 

@@ -84,9 +84,9 @@ static inline int rnd_int(uint32_t *s, int count){    /* bounded 0..count-1 */
 /* ── Palette effect IDs (0 = Off; group order = LED colour) ──────────────────── */
 enum {
     PFX_OFF = 0,
-    /* Character (group 0) */ PFX_DRIVE, PFX_SWEETEN, PFX_FUZZ, PFX_HOWL, PFX_SWELL, PFX_FOLD,
+    /* Character (group 0) */ PFX_DRIVE, PFX_SWEETEN, PFX_FUZZ, PFX_HOWL, PFX_FOLD, PFX_SWELL,
     /* Movement  (group 1) */ PFX_DOUBLER, PFX_VIBRATO, PFX_PHASER, PFX_TREMOLO, PFX_PITCH, PFX_SHIFT,
-    /* Diffusion (group 2) */ PFX_CASCADE, PFX_REELS, PFX_SPACE, PFX_COLLAGE, PFX_REVERSE, PFX_BLOOM,
+    /* Diffusion (group 2) */ PFX_CASCADE, PFX_REELS, PFX_COLLAGE, PFX_REVERSE, PFX_SPACE, PFX_BLOOM,
     /* Texture   (group 3) */ PFX_FILTER, PFX_SQUASH, PFX_CASSETTE, PFX_BROKEN, PFX_INTERFERENCE, PFX_FREEZE,
     PFX_COUNT               /* = 25 (Off + 24) */
 };
@@ -95,9 +95,9 @@ enum {
 /* Display names — index 0..24. get_param for selects MUST return these strings. */
 static const char *FX_NAMES[PFX_COUNT] = {
     "Off",
-    "Drive","Sweeten","Fuzz","Howl","Swell","Fold",
+    "Drive","Sweeten","Fuzz","Howl","Fold","Swell",
     "Doubler","Vibrato","Phaser","Tremolo","Pitch","Shift",
-    "Cascade","Reels","Space","Collage","Reverse","Bloom",
+    "Cascade","Reels","Collage","Reverse","Space","Bloom",
     "Filter","Squash","Cassette","Broken","Interference","Freeze"
 };
 static const uint8_t FX_GROUP[PFX_COUNT] = {
@@ -148,7 +148,8 @@ typedef struct {
 typedef struct {
     int   select;             /* PFX_* id (0 = Off) */
     int   prev_select;        /* for Skip-walk direction inference */
-    float amount, macro, drift;
+    float amount, macro, drift;       /* knob targets */
+    float amt_sm, mac_sm, drf_sm;     /* 20 ms analog-style smoothed values (fed to DSP) */
     float ramp;               /* 0..1 click-free fade-in after an effect switch */
     slot_dsp_t dsp;
 } slot_t;
@@ -175,8 +176,9 @@ typedef struct {
     slot_t slots[NUM_SLOTS];
     float  input_vol;         /* 0..2, unity = 1 */
     float  mix;               /* 0..1 global dry/wet */
+    float  iv_sm, mix_sm;     /* 20 ms smoothed globals */
     int    fx_reorder;        /* 0..23 permutation index (0 = 1-2-3-4) */
-    int    current_preset;    /* 1..25 */
+    int    current_preset;    /* 1..50 */
     int    current_level;     /* page-aware knob overlay (see LEVELS) */
     uint32_t rng;
     /* scratch buffers for slot processing (per block) */
@@ -282,22 +284,25 @@ static void fx_sweeten(slot_dsp_t *s, float *l, float *r, int n,
                        float amount, float macro, float drift){
     float tilt=(macro-0.5f)*2.0f;
     float thr=0.5f, ratio=0.35f+amount*0.4f;         /* gentle comp */
-    float density=amount*2.5f, dwet=clampf(density,0.0f,1.0f);  /* Density sat amount */
+    float density=amount*1.6f, dwet=clampf(density,0.0f,1.0f);  /* Density sat amount */
+    float comp=1.0f/(1.0f+density*0.5f);             /* compensate sin-fold gain */
     for(int i=0;i<n;i++){
         float mono=0.5f*(fabsf(l[i])+fabsf(r[i]));
         s->env += (mono>s->env?0.02f:0.004f)*(mono-s->env)+DENORM;  /* fast atk slow rel */
         float gr=1.0f; if(s->env>thr) gr=1.0f-(1.0f-thr/s->env)*ratio;
         float dl=(drift>0.0f)? 1.0f+wander(&s->f1,&s->seed,0.0004f)*drift*0.03f : 1.0f;
         for(int ch=0;ch<2;ch++){
-            float x=(ch?r:l)[i]*gr*dl;
-            /* Airwindows Density sin-fold saturator */
+            float dry=(ch?r:l)[i];
+            float x=dry*gr*dl;
+            /* Airwindows Density sin-fold saturator (level-compensated) */
             float br=fabsf(x*(1.0f+density)); if(br>1.57079633f)br=1.57079633f; br=sinf(br);
-            float sat=(x>0.0f)? x*(1.0f-dwet)+br*dwet : x*(1.0f-dwet)-br*dwet;
+            float sat=((x>0.0f)? x*(1.0f-dwet)+br*dwet : x*(1.0f-dwet)-br*dwet)*comp;
             /* Air-style HF tilt shelf (macro) */
             float *z=ch?&s->z1r:&s->z1l;
             *z += 0.10f*(sat-*z)+DENORM;              /* LP component */
-            (ch?r:l)[i]=(tilt>=0.0f)? sat+(sat-*z)*tilt*1.6f      /* brighten = air */
-                                    : lerpf(sat,*z,-tilt);        /* darken */
+            float wet=(tilt>=0.0f)? sat+(sat-*z)*tilt*0.8f      /* brighten = air */
+                                  : lerpf(sat,*z,-tilt);        /* darken */
+            (ch?r:l)[i]=lerpf(dry,wet,amount);        /* amount=0 → dry */
         }
     }
 }
@@ -385,17 +390,19 @@ static void fx_fold(slot_dsp_t *s, float *l, float *r, int n,
     const float kScale=2048.0f/2.295f;               /* Warps: 2048/((2+0.25)*1.02) */
     float drive=0.5f+amount*amount*4.0f;
     float off=(macro-0.5f)*1.6f;
+    float comp=0.55f/(0.6f+0.4f*drive);              /* level compensation — folding is loud */
     for(int i=0;i<n;i++){
         float w=(drift>0.0f? wander(&s->f1,&s->seed,0.0009f)*drift*0.25f:0.0f);
         for(int ch=0;ch<2;ch++){
-            float x=(ch?r:l)[i]*drive + off + w;
+            float dry=(ch?r:l)[i];
+            float x=dry*drive + off + w;
             float idx=x*kScale + 2048.0f;             /* index into lut_bipolar_fold */
             int i0=(int)idx; if(i0<1)i0=1; else if(i0>4094)i0=4094;
             float fr=idx-(float)i0; if(fr<0.0f)fr=0.0f; else if(fr>1.0f)fr=1.0f;
             float y=lut_bipolar_fold[i0]+(lut_bipolar_fold[i0+1]-lut_bipolar_fold[i0])*fr;
             float *z=ch?&s->z1r:&s->z1l;
-            *z += 0.5f*(y-*z)+DENORM;                  /* mild LP smooth */
-            (ch?r:l)[i]=lerpf((ch?r:l)[i],*z*1.1f,clampf(amount*1.3f,0.0f,1.0f));
+            *z += 0.5f*(y*comp-*z)+DENORM;             /* mild LP smooth, level-matched */
+            (ch?r:l)[i]=lerpf(dry,*z,amount);          /* amount=0 → dry */
         }
     }
 }
@@ -422,9 +429,9 @@ static void fx_doubler(slot_dsp_t *s, float *l, float *r, int n,
     }
 }
 
-/* VIBRATO — modulated delay (no dry). Adds the Airwindows Vibrato character:
- * a 2nd LFO through-zero-FMs the primary sweep (richer than a single sine), plus
- * an HF restore to offset linear-interpolation dulling. amount=depth, macro=rate,
+/* VIBRATO — fully-stereo modulated delay. L and R get the SAME LFO 90° apart
+ * (true stereo vibrato/widening). 2nd LFO through-zero-FMs the sweep (Airwindows
+ * character) + HF restore for interpolation dulling. amount=depth, macro=rate,
  * drift=sine→random waveshape + FM depth. lfo=main phase, lfo2=FM phase. */
 static void fx_vibrato(slot_dsp_t *s, float *l, float *r, int n,
                        float amount, float macro, float drift){
@@ -437,13 +444,15 @@ static void fx_vibrato(slot_dsp_t *s, float *l, float *r, int n,
         s->lfo2+=fmRate/SR; if(s->lfo2>=1.0f)s->lfo2-=1.0f;
         s->lfo+=(rate*(1.0f+fmDepth*0.5f*sinf(s->lfo2*TWO_PI)))/SR;  /* through-zero FM */
         if(s->lfo>=1.0f)s->lfo-=1.0f; if(s->lfo<0.0f)s->lfo+=1.0f;
-        float sine=sinf(s->lfo*TWO_PI);
-        float rnd=(drift>0.0f? wander(&s->f1,&s->seed,0.02f):0.0f);
-        float mod=lerpf(sine,rnd,clampf(drift,0.0f,0.9f));
-        float d=base+depth*(1.0f+mod);
+        float phR=s->lfo+0.25f; if(phR>=1.0f)phR-=1.0f;   /* R 90° offset = stereo */
+        float rndL=(drift>0.0f? wander(&s->f1,&s->seed,0.02f):0.0f);
+        float rndR=(drift>0.0f? wander(&s->f3,&s->seed,0.02f):0.0f);
+        float modL=lerpf(sinf(s->lfo*TWO_PI),rndL,clampf(drift,0.0f,0.9f));
+        float modR=lerpf(sinf(phR*TWO_PI),    rndR,clampf(drift,0.0f,0.9f));
+        float dL=base+depth*(1.0f+modL), dR=base+depth*(1.0f+modR);
         s->dl_l[s->wp]=l[i]; s->dl_r[s->wp]=r[i];
-        float oL=dlr(s->dl_l,s->wp,d), oR=dlr(s->dl_r,s->wp,d);
-        /* HF restore: high-shelf the interpolation loss back in (one-pole HP add) */
+        float oL=dlr(s->dl_l,s->wp,dL), oR=dlr(s->dl_r,s->wp,dR);
+        /* HF restore: high-shelf the interpolation loss back in */
         s->z1l+=0.4f*(oL-s->z1l)+DENORM; oL+=(oL-s->z1l)*0.25f;
         s->z1r+=0.4f*(oR-s->z1r)+DENORM; oR+=(oR-s->z1r)*0.25f;
         l[i]=oL; r[i]=oR;
@@ -481,11 +490,10 @@ static void fx_phaser(slot_dsp_t *s, float *l, float *r, int n,
     }
 }
 
-/* TREMOLO — PORTED from Airwindows Tremolo (Chris Johnson, MIT): per-block
- * param-chase smoothing (zipper-free) + skew/density waveshaping that morphs the
- * modulation from soft (sine-of-sine) to hard (1-cos) with depth. amount=depth,
- * macro=rate, drift=rate wander. State: sm1/sm2=chased speed/depth, f4/f5=last
- * targets, lfo=sweep phase (radians). */
+/* TREMOLO — Airwindows Tremolo (Chris Johnson, MIT): chase-smoothed skew/density
+ * waveshaping. amount=depth, macro=rate. DRIFT = AutoPan: morphs L/R from in-phase
+ * (mono tremolo) to anti-phase (the channels duck oppositely → the modulation pans
+ * across the stereo field). State: sm1/sm2=chased speed/depth, f4/f5=last targets. */
 static void fx_tremolo(slot_dsp_t *s, float *l, float *r, int n,
                        float amount, float macro, float drift){
     float speedChase=macro*macro*macro*macro;          /* A^4 (Airwindows) */
@@ -493,11 +501,11 @@ static void fx_tremolo(slot_dsp_t *s, float *l, float *r, int n,
     float speedSpeed=300.0f/(fabsf(s->f4-speedChase)+1.0f);
     float depthSpeed=300.0f/(fabsf(s->f5-depthChase)+1.0f);
     s->f4=speedChase; s->f5=depthChase;
+    float pan=clampf(drift,0.0f,1.0f);
     for(int i=0;i<n;i++){
         s->sm1=((s->sm1*speedSpeed)+speedChase)/(speedSpeed+1.0f);
         s->sm2=((s->sm2*depthSpeed)+depthChase)/(depthSpeed+1.0f);
-        float drf=(drift>0.0f? wander(&s->f2,&s->seed,0.002f)*drift*0.2f:0.0f);
-        float speed=(0.0001f+(s->sm1/1000.0f))*(1.0f+drf);
+        float speed=0.0001f+(s->sm1/1000.0f);
         float skew=1.0f+powf(s->sm2,9.0f);
         float density=((1.0f-s->sm2)*2.0f)-1.0f;
         float offset=sinf(s->lfo);
@@ -505,14 +513,14 @@ static void fx_tremolo(slot_dsp_t *s, float *l, float *r, int n,
         float control=fabsf(offset);
         if(density>0.0f) control=control*(1.0f-density)+sinf(control)*density;
         else             control=control*(1.0f+density)+(1.0f-cosf(control))*(-density);
-        float thickness=((control*2.0f)-1.0f)*skew;
-        float out=fabsf(thickness);
+        float ctl[2]={control, lerpf(control,1.0f-control,pan)};  /* R anti-phase at drift=1 */
         for(int ch=0;ch<2;ch++){
+            float thickness=((ctl[ch]*2.0f)-1.0f)*skew;
+            float out=fabsf(thickness);
             float x=(ch?r:l)[i];
             float br=fabsf(x); if(br>1.57079633f)br=1.57079633f;
             br=(thickness>0.0f)? sinf(br) : (1.0f-cosf(br));
-            float y=(x>0.0f)? x*(1.0f-out)+br*out : x*(1.0f-out)-br*out;
-            (ch?r:l)[i]=y;
+            (ch?r:l)[i]=(x>0.0f)? x*(1.0f-out)+br*out : x*(1.0f-out)-br*out;
         }
     }
 }
@@ -524,7 +532,8 @@ static void fx_pitch(slot_dsp_t *s, float *l, float *r, int n,
     float ratio=powf(2.0f,(macro-0.5f)*2.0f);        /* 0.5 .. 2.0 */
     float win=SR*0.040f;                              /* 40 ms window */
     float drate=(1.0f-ratio);                         /* read-ptr drift / sample */
-    int crush=(drift>0.0f)?(int)(1.0f+drift*drift*14.0f):0;
+    /* drift = gentle resolution drop: 9 bits (subtle) → 4 bits (gritty), blended in */
+    float q=(drift>0.0f)? powf(2.0f, 9.0f-drift*5.0f) : 0.0f;
     for(int i=0;i<n;i++){
         s->dl_l[s->wp]=l[i]; s->dl_r[s->wp]=r[i];
         s->f1+=drate; if(s->f1<0)s->f1+=win; if(s->f1>=win)s->f1-=win;
@@ -534,7 +543,10 @@ static void fx_pitch(slot_dsp_t *s, float *l, float *r, int n,
         float oL=dlr(s->dl_l,s->wp,win-s->f1)*w1 + dlr(s->dl_l,s->wp,win-p2)*w2;
         float oR=dlr(s->dl_r,s->wp,win-s->f1)*w1 + dlr(s->dl_r,s->wp,win-p2)*w2;
         s->wp=(s->wp+1)%MAX_DELAY;
-        if(crush>0){ float q=(float)crush*4.0f; oL=floorf(oL*q)/q; oR=floorf(oR*q)/q; }
+        if(q>0.0f){ /* round (no DC bias), blend by drift so low drift stays subtle */
+            oL=lerpf(oL, floorf(oL*q+0.5f)/q, drift);
+            oR=lerpf(oR, floorf(oR*q+0.5f)/q, drift);
+        }
         l[i]=lerpf(l[i],oL,amount); r[i]=lerpf(r[i],oR,amount);
     }
 }
@@ -573,38 +585,47 @@ static void fx_shift(slot_dsp_t *s, float *l, float *r, int n,
 
 /* ── DIFFUSION ─────────────────────────────────────────────────────────────── */
 
-/* delay-core helper: BBD/tape echo. self_osc selects fb cap (0.95 vs 1.05). */
+/* delay-core helper. Differentiates BBD vs tape via: feedback cap, HF damping,
+ * wow rate/depth, flutter, feedback saturation drive, and tape hiss. The wet tap
+ * scales with amount so amount=0 → dry. */
 static void delay_core(slot_dsp_t *s, float *l, float *r, int n,
                        float amount, float macro, float drift,
-                       float fb_cap, float lp_amt, float wow_hz, float wow_depth){
+                       float fb_cap, float lp_amt, float wow_hz, float wow_depth,
+                       float sat_drive, float flutter_depth, float hiss){
     float t=SR*(0.03f*powf(40.0f,macro));            /* 30 ms .. 1.2 s exp */
     float fb=amount*fb_cap;
+    float wet=clampf(amount*1.4f,0.0f,1.0f);          /* amount=0 → dry */
     for(int i=0;i<n;i++){
-        s->lfo+=wow_hz/SR; if(s->lfo>=1.0f)s->lfo-=1.0f;
+        s->lfo+=wow_hz/SR;  if(s->lfo>=1.0f)s->lfo-=1.0f;     /* wow */
+        s->lfo2+=6.3f/SR;   if(s->lfo2>=1.0f)s->lfo2-=1.0f;   /* flutter */
         float wob=wow_depth*sinf(s->lfo*TWO_PI)
+                 + flutter_depth*sinf(s->lfo2*TWO_PI)
                  + (drift>0.0f? wander(&s->f1,&s->seed,0.001f)*drift*wow_depth*3.0f:0.0f);
         float d=t*(1.0f+wob);
         float tapL=dlr(s->dl_l,s->wp,d), tapR=dlr(s->dl_r,s->wp,d);
-        /* 2-pole LP darkening in the feedback */
+        /* 2-pole LP darkening in the feedback (more = warmer/tape) */
         s->z1l+=lp_amt*(tapL-s->z1l)+DENORM; s->z2l+=lp_amt*(s->z1l-s->z2l)+DENORM;
         s->z1r+=lp_amt*(tapR-s->z1r)+DENORM; s->z2r+=lp_amt*(s->z1r-s->z2r)+DENORM;
-        /* krautdrums-move delay_saturate in the feedback (tanh drive + asym, DC-removed) */
-        float fl=delay_saturate(s->z2l*fb, 1.5f, 0.02f);
-        float fr=delay_saturate(s->z2r*fb, 1.5f, 0.02f);
+        float fl=delay_saturate(s->z2l*fb, sat_drive, 0.02f);
+        float fr=delay_saturate(s->z2r*fb, sat_drive, 0.02f);
+        if(hiss>0.0f){ float sig=fabsf(tapL)+fabsf(tapR);   /* gated tape hiss */
+            if(sig>0.001f){ fl+=hiss*(frand(&s->seed)-0.5f); fr+=hiss*(frand(&s->seed)-0.5f); } }
         s->dl_l[s->wp]=l[i]+fl; s->dl_r[s->wp]=r[i]+fr;
         s->wp=(s->wp+1)%MAX_DELAY;
-        l[i]=l[i]+tapL*0.9f; r[i]=r[i]+tapR*0.9f;
+        l[i]+=tapL*0.9f*wet; r[i]+=tapR*0.9f*wet;
     }
 }
-/* CASCADE — BBD analog delay, dark, can self-oscillate. */
+/* CASCADE — BBD bucket-brigade: brighter-but-bandlimited repeats, fast subtle
+ * clock warble, moderate saturation, no hiss. Clean-ish, metallic, can self-osc. */
 static void fx_cascade(slot_dsp_t *s, float *l, float *r, int n,
                        float amount, float macro, float drift){
-    delay_core(s,l,r,n,amount,macro,drift,0.95f,0.28f,0.15f,0.0008f);
+    delay_core(s,l,r,n,amount,macro,drift,0.95f,0.22f,6.0f,0.00035f,1.3f,0.0f,0.0f);
 }
-/* REELS — worn tape echo (RE-201): higher fb cap (self-osc), more wow. */
+/* REELS — worn tape echo (RE-201): warmer/darker, slow wow + flutter, heavier
+ * tape saturation, gated hiss, higher feedback cap (self-oscillates). */
 static void fx_reels(slot_dsp_t *s, float *l, float *r, int n,
                      float amount, float macro, float drift){
-    delay_core(s,l,r,n,amount,macro,drift,1.05f,0.34f,0.7f,0.0016f);
+    delay_core(s,l,r,n,amount,macro,drift,1.05f,0.42f,0.7f,0.0016f,1.9f,0.0006f,0.0022f);
 }
 
 /* REVERSE — reverse delay. amount=wet mix, macro=segment time, drift=pitch mod.
@@ -651,36 +672,30 @@ static void fx_collage(slot_dsp_t *s, float *l, float *r, int n,
 
 /* FILTER — multimode Tilt/LP/HP (SVF) with resonance. amount=cutoff,
  * macro=mode (0 LP · 0.5 tilt · 1 HP), drift=cutoff wander. */
-/* PORTED from Airwindows Capacitor (Chris Johnson, MIT): leaky-integrator pole
- * recurrence with per-block "chased" cutoff smoothing. Capacitor rotates 6 poles;
- * we cascade 3 HP + 3 LP every sample. macro morphs LP · flat · HP; amount=cutoff.
- * State: ap[0..2]=HP poles, ap[3..5]=LP poles (per ch); sm1/sm2=chased amounts;
- * f4/f5=last chase targets; f1=drift. */
+/* FILTER — single-knob DJ filter on a resonant Cytomic/TPT SVF (stable). amount
+ * sweeps LP→through→HP (center = open/neutral, like a DJ isolator); macro = resonance;
+ * drift = cutoff wander. State per ch: lp_*=ic1eq, bp_*=ic2eq. */
 static void fx_filter(slot_dsp_t *s, float *l, float *r, int n,
                       float amount, float macro, float drift){
-    float lp_mode=clampf(1.0f-macro*2.0f,0.0f,1.0f);  /* LP active in low half */
-    float hp_mode=clampf(macro*2.0f-1.0f,0.0f,1.0f);  /* HP active in high half */
     float amt=clampf(amount,0.0f,1.0f);
-    if(drift>0.0f) amt=clampf(amt+wander(&s->f1,&s->seed,0.0007f)*drift*0.3f,0.0f,1.0f);
-    float a2=amt*amt;
-    float lowpassChase =lerpf(1.0f,a2,lp_mode);       /* 1 = open */
-    float highpassChase=lerpf(0.0f,a2,hp_mode);       /* 0 = open */
-    float lowpassSpeed =300.0f/(fabsf(s->f4-lowpassChase )+1.0f);
-    float highpassSpeed=300.0f/(fabsf(s->f5-highpassChase)+1.0f);
-    s->f4=lowpassChase; s->f5=highpassChase;
-    for(int i=0;i<n;i++){
-        s->sm1=((s->sm1*lowpassSpeed)+lowpassChase )/(lowpassSpeed +1.0f); float invLP=1.0f-s->sm1;
-        s->sm2=((s->sm2*highpassSpeed)+highpassChase)/(highpassSpeed+1.0f); float invHP=1.0f-s->sm2;
-        for(int ch=0;ch<2;ch++){
-            float *hp=ch?s->ap_r:s->ap_l, *lpp=(ch?s->ap_r:s->ap_l)+3;
-            float x=(ch?r:l)[i];
-            hp[0]=hp[0]*invHP + x*s->sm2 + DENORM; x-=hp[0];   /* 3 highpass poles */
-            hp[1]=hp[1]*invHP + x*s->sm2 + DENORM; x-=hp[1];
-            hp[2]=hp[2]*invHP + x*s->sm2 + DENORM; x-=hp[2];
-            lpp[0]=lpp[0]*invLP + x*s->sm1 + DENORM; x=lpp[0]; /* 3 lowpass poles */
-            lpp[1]=lpp[1]*invLP + x*s->sm1 + DENORM; x=lpp[1];
-            lpp[2]=lpp[2]*invLP + x*s->sm1 + DENORM; x=lpp[2];
-            (ch?r:l)[i]=x;
+    int hp; float fc;
+    if(amt<0.5f){ hp=0; fc=200.0f*powf(90.0f, amt*2.0f); }        /* LP 200 Hz .. 18 kHz */
+    else        { hp=1; fc=20.0f *powf(20.0f,(amt-0.5f)*2.0f); }  /* HP 20 Hz .. 400 Hz */
+    if(drift>0.0f) fc*=1.0f+wander(&s->f1,&s->seed,0.0007f)*drift*0.3f;
+    fc=clampf(fc,20.0f,18000.0f);
+    float wetx=clampf(fabsf(amt-0.5f)/0.05f,0.0f,1.0f);           /* dry exactly at center */
+    float g=tanf(3.14159265f*fc/SR);
+    float k=1.0f-clampf(macro,0.0f,1.0f)*0.9f;                    /* resonance (1/Q) */
+    float a1=1.0f/(1.0f+g*(g+k)), a2=g*a1, a3=g*a2;
+    for(int ch=0;ch<2;ch++){
+        float *ic1=ch?&s->lp_r:&s->lp_l, *ic2=ch?&s->bp_r:&s->bp_l;
+        float *src=ch?r:l;
+        for(int i=0;i<n;i++){
+            float x=src[i];
+            float v3=x-*ic2, v1=a1*(*ic1)+a2*v3, v2=*ic2+a2*(*ic1)+a3*v3;
+            *ic1=2.0f*v1-*ic1+DENORM; *ic2=2.0f*v2-*ic2+DENORM;
+            float filt=hp? (x-k*v1-v2) : v2;          /* HP or LP tap */
+            src[i]=lerpf(x,filt,wetx);
         }
     }
 }
@@ -700,7 +715,8 @@ static void fx_squash(slot_dsp_t *s, float *l, float *r, int n,
     float mewiness=(macro*2.0f)-1.0f, unmew;
     int positivemu; if(mewiness>=0){positivemu=1;unmew=1.0f-mewiness;}
                     else{positivemu=0;mewiness=-mewiness;unmew=1.0f-mewiness;}
-    float outGain=1.0f+A*0.6f;                           /* gentle makeup */
+    float outGain=1.0f;
+    float comp=0.5f+0.5f*threshold;                      /* gain-comp: cancels the 1/threshold makeup */
     for(int i=0;i<n;i++){
         float th=threshold*(drift>0.0f?(1.0f+wander(&s->f5,&s->seed,0.004f)*drift*0.2f):1.0f);
         float xl=l[i]*muMakeupGain, xr=r[i]*muMakeupGain;
@@ -724,7 +740,7 @@ static void fx_squash(slot_dsp_t *s, float *l, float *r, int n,
         /* Pressure4 second-stage sin() overdrive */
         float br=fabsf(xl); br=(br>1.57079633f)?1.0f:sinf(br); xl=(xl>0)?br:-br;
         br=fabsf(xr);      br=(br>1.57079633f)?1.0f:sinf(br); xr=(xr>0)?br:-br;
-        l[i]=xl; r[i]=xr;
+        l[i]=xl*comp; r[i]=xr*comp;                      /* level-matched output */
         s->i1^=1;
     }
 }
@@ -790,7 +806,7 @@ static void fx_interference(slot_dsp_t *s, float *l, float *r, int n,
     float targetA=A*A*A+0.0005f; if(targetA>1.0f)targetA=1.0f;
     float soften=(1.0f+targetA)/2.0f;
     float targetB=powf(1.0f-A,3.0f)/3.0f;             /* bit depth derez */
-    float hard=0.3f;
+    float hard=0.45f;                                 /* more dry blend = less harsh */
     float carr=200.0f+macro*macro*3000.0f;
     const float L256=logf(256.0f);
     for(int i=0;i<n;i++){
@@ -831,7 +847,8 @@ static void fx_interference(slot_dsp_t *s, float *l, float *r, int n,
         s->z3l=in[0]; s->z3r=in[1];                    /* lastDry = dry input */
         s->z4l=lastOut[0]; s->z4r=lastOut[1];
         s->lfo+=carr/SR; if(s->lfo>=1.0f)s->lfo-=1.0f;
-        l[i]=out[0]; r[i]=out[1];
+        l[i]=lerpf(in[0], out[0]*0.85f, amount);       /* amount=0 → dry; trim µ-law boost */
+        r[i]=lerpf(in[1], out[1]*0.85f, amount);
     }
 }
 
@@ -1021,11 +1038,11 @@ static void *create_instance(const char *module_dir, const char *json){
         p->slots[s].dsp.dl_r = calloc(MAX_DELAY,sizeof(float));
         p->slots[s].dsp.seed = 0x9e3779b9u + (uint32_t)s*0x6d2b79f5u + 1u;
     }
-    p->input_vol = 1.0f;
-    p->mix = 1.0f;                              /* design-spec: Mix default 100% */
+    p->input_vol = 1.0f; p->iv_sm = 1.0f;
+    p->mix = 1.0f; p->mix_sm = 1.0f;            /* design-spec: Mix default 100% */
     p->fx_reorder = 0;                          /* 1-2-3-4 */
     p->current_preset = 1;
-    p->current_level = 0;                       /* Presets (landing) */
+    p->current_level = 1;                       /* LV_PALETTE — landing mirrors Console knobs */
     p->rng = 0x12345678u;
     if(g_host && g_host->log) g_host->log("[palette] instance created");
     return p;
@@ -1044,8 +1061,9 @@ static void destroy_instance(void *instance){
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 /* Levels for page-aware knob overlay. Index 0 = root/Presets (landing). */
+/* Knob-overlay pages. 0 = root/landing (preset+rnd knobs), 1 = Console (the
+ * 8-knob amount/macro page), 2/3 = FX slot pages. */
 enum { LV_PRESETS=0, LV_PALETTE, LV_FX12, LV_FX34, NUM_LEVELS };
-static const char *LEVEL_NAMES[NUM_LEVELS] = { "Presets","PALETTE","FX12","FX34" };
 
 /* knob (1..8) → param key, per level. NULL = unused knob. */
 static const char *LEVEL_KNOBS[NUM_LEVELS][8] = {
@@ -1106,7 +1124,7 @@ static void apply_knob_delta(palette_t *p, const char *key, int delta){
         load_preset(p, clampi(p->current_preset+delta,1,25));
         return;
     }
-    if(!strncmp(key,"rnd_",4)){ if(delta!=0) fire_trigger(p,key); return; }
+    if(!strncmp(key,"rnd_",4)){ return; }  /* momentary enum: fires via direct set_param("1") only */
     /* floats */
     float step = (!strcmp(key,"input_vol")) ? 0.01f : 0.01f;
     set_float_key(p,key, get_float_key(p,key)+delta*step);
@@ -1115,9 +1133,13 @@ static void apply_knob_delta(palette_t *p, const char *key, int delta){
 static void set_param(void *instance, const char *key, const char *val){
     palette_t *p=(palette_t*)instance; if(!p||!key||!val) return;
 
-    /* active page for knob overlay */
-    if(!strcmp(key,"_level")){
-        for(int i=0;i<NUM_LEVELS;i++) if(!strcmp(val,LEVEL_NAMES[i])){ p->current_level=i; break; }
+    /* active page for knob overlay. Host sends the level KEY or the module name;
+     * "root"/"PALETTE" (module) → landing (presets), "Console" → page 1. */
+    if(!strcmp(key,"_level") || !strcmp(key,"current_level")){
+        if(!strcmp(val,"root")||!strcmp(val,"PALETTE")||!strcmp(val,"Console")) p->current_level=LV_PALETTE;
+        else if(!strcmp(val,"Presets")) p->current_level=LV_PRESETS;
+        else if(!strcmp(val,"FX12")) p->current_level=LV_FX12;
+        else if(!strcmp(val,"FX34")) p->current_level=LV_FX34;
         return;
     }
     /* knob_N_adjust — resolve via current level's knob map */
@@ -1192,16 +1214,19 @@ static int get_param(void *instance, const char *key, char *buf, int buf_len){
         o+=snprintf(buf+o,buf_len-o,
           "{\"modes\":null,\"levels\":{"
           "\"root\":{\"name\":\"PALETTE\","
-          "\"knobs\":[\"current_preset\",\"rnd_patch\",\"rnd_effect\",\"rnd_amount\",\"rnd_macro\",\"rnd_drift\",\"input_vol\",\"mix\"],"
+          "\"knobs\":[\"fx1_amount\",\"fx1_macro\",\"fx2_amount\",\"fx2_macro\",\"fx3_amount\",\"fx3_macro\",\"fx4_amount\",\"fx4_macro\"],"
           "\"params\":["
-          "{\"level\":\"PALETTE\",\"label\":\"PALETTE\"},"
+          "{\"level\":\"Console\",\"label\":\"PALETTE\"},"
+          "{\"level\":\"Presets\",\"label\":\"PRESETS&RND\"},"
           "{\"level\":\"FX12\",\"label\":\"FX 1&2\"},"
-          "{\"level\":\"FX34\",\"label\":\"FX 3&4\"},"
-          "{\"key\":\"fx_reorder\",\"label\":\"FX Reorder\"}"
+          "{\"level\":\"FX34\",\"label\":\"FX 3&4\"}"
           "]},"
-          "\"PALETTE\":{\"name\":\"PALETTE\","
+          "\"Console\":{\"name\":\"PALETTE\","
           "\"knobs\":[\"fx1_amount\",\"fx1_macro\",\"fx2_amount\",\"fx2_macro\",\"fx3_amount\",\"fx3_macro\",\"fx4_amount\",\"fx4_macro\"],"
           "\"params\":[\"fx1_amount\",\"fx1_macro\",\"fx2_amount\",\"fx2_macro\",\"fx3_amount\",\"fx3_macro\",\"fx4_amount\",\"fx4_macro\"]},"
+          "\"Presets\":{\"name\":\"PRESETS&RND\","
+          "\"knobs\":[\"current_preset\",\"rnd_patch\",\"rnd_effect\",\"rnd_amount\",\"rnd_macro\",\"rnd_drift\",\"input_vol\",\"mix\"],"
+          "\"params\":[\"current_preset\",\"rnd_patch\",\"rnd_effect\",\"rnd_amount\",\"rnd_macro\",\"rnd_drift\",\"input_vol\",\"mix\",\"fx_reorder\"]},"
           "\"FX12\":{\"name\":\"FX 1&2\","
           "\"knobs\":[\"fx1_select\",\"fx1_amount\",\"fx1_macro\",\"fx1_drift\",\"fx2_select\",\"fx2_amount\",\"fx2_macro\",\"fx2_drift\"],"
           "\"params\":[\"fx1_select\",\"fx1_amount\",\"fx1_macro\",\"fx1_drift\",\"fx2_select\",\"fx2_amount\",\"fx2_macro\",\"fx2_drift\"]},"
@@ -1231,12 +1256,12 @@ static int get_param(void *instance, const char *key, char *buf, int buf_len){
         o+=snprintf(buf+o,buf_len-o,
           "{\"key\":\"input_vol\",\"name\":\"Input Vol\",\"type\":\"float\",\"min\":0,\"max\":2,\"step\":0.01},"
           "{\"key\":\"mix\",\"name\":\"Mix\",\"type\":\"float\",\"min\":0,\"max\":1,\"step\":0.01},"
-          "{\"key\":\"current_preset\",\"name\":\"Preset\",\"type\":\"int\",\"min\":1,\"max\":25,\"step\":1},"
-          "{\"key\":\"rnd_patch\",\"name\":\"Rnd Patch\",\"type\":\"int\",\"min\":0,\"max\":127,\"step\":1},"
-          "{\"key\":\"rnd_effect\",\"name\":\"Rnd FX\",\"type\":\"int\",\"min\":0,\"max\":127,\"step\":1},"
-          "{\"key\":\"rnd_amount\",\"name\":\"Rnd Amt\",\"type\":\"int\",\"min\":0,\"max\":127,\"step\":1},"
-          "{\"key\":\"rnd_macro\",\"name\":\"Rnd Macro\",\"type\":\"int\",\"min\":0,\"max\":127,\"step\":1},"
-          "{\"key\":\"rnd_drift\",\"name\":\"Rnd Drift\",\"type\":\"int\",\"min\":0,\"max\":127,\"step\":1},");
+          "{\"key\":\"current_preset\",\"name\":\"Preset\",\"type\":\"int\",\"min\":1,\"max\":50,\"step\":1},"
+          "{\"key\":\"rnd_patch\",\"name\":\"Rnd Patch\",\"type\":\"enum\",\"options\":[\"0\",\"1\"]},"
+          "{\"key\":\"rnd_effect\",\"name\":\"Rnd FX\",\"type\":\"enum\",\"options\":[\"0\",\"1\"]},"
+          "{\"key\":\"rnd_amount\",\"name\":\"Rnd Amt\",\"type\":\"enum\",\"options\":[\"0\",\"1\"]},"
+          "{\"key\":\"rnd_macro\",\"name\":\"Rnd Macro\",\"type\":\"enum\",\"options\":[\"0\",\"1\"]},"
+          "{\"key\":\"rnd_drift\",\"name\":\"Rnd Drift\",\"type\":\"enum\",\"options\":[\"0\",\"1\"]},");
         /* FX Reorder — menu-only enum of all 24 chain permutations */
         o+=snprintf(buf+o,buf_len-o,"{\"key\":\"fx_reorder\",\"name\":\"FX Reorder\",\"type\":\"enum\",\"options\":[");
         for(int i=0;i<24;i++){ char lb[16]; perm_label(i,lb,sizeof lb);
@@ -1313,7 +1338,10 @@ static void process_block(void *instance, int16_t *buf, int frames){
     if(frames>MAXFRAMES) frames=MAXFRAMES;
 
     const uint8_t *order = PERM[clampi(p->fx_reorder,0,23)];
-    float iv = p->input_vol;
+    float gsm = 1.0f - expf(-(float)frames/(0.020f*SR));     /* 20 ms smooth for globals */
+    p->iv_sm  += gsm*(p->input_vol - p->iv_sm);
+    p->mix_sm += gsm*(p->mix       - p->mix_sm);
+    float iv = p->iv_sm;
 
     /* de-interleave + input volume (dry kept for mix) */
     float dryL[MAXFRAMES], dryR[MAXFRAMES];
@@ -1324,28 +1352,35 @@ static void process_block(void *instance, int16_t *buf, int frames){
     }
     /* run the 4 slots in reorder sequence (Off = passthrough, never dispatched).
      * Clouds effects dispatch through the opaque heavy interface; C effects use the
-     * vtable. A just-switched slot fades input→output over ~12 ms (click-free). */
-    const float ramp_inc = 1.0f / (SR * 0.012f);
+     * vtable. Per-slot 20 ms analog-style smoothing of amount/macro/drift (no zipper
+     * on knob moves or preset/random loads). A just-switched slot fades input→output
+     * over ~25 ms with a smoothstep curve (click-free switching). */
+    const float psm = 1.0f - expf(-(float)frames/(0.020f*SR));   /* 20 ms param smooth */
+    const float ramp_inc = 1.0f / (SR * 0.025f);                 /* 25 ms switch fade */
     float preL[MAXFRAMES], preR[MAXFRAMES];
     for(int k=0;k<NUM_SLOTS;k++){
         slot_t *sl=&p->slots[order[k]];
         int fx=sl->select;
         if(fx==PFX_OFF) continue;
+        sl->amt_sm += psm*(sl->amount - sl->amt_sm);
+        sl->mac_sm += psm*(sl->macro  - sl->mac_sm);
+        sl->drf_sm += psm*(sl->drift  - sl->drf_sm);
         int ramping = sl->ramp < 1.0f;
         if(ramping){ memcpy(preL,p->L,frames*sizeof(float)); memcpy(preR,p->R,frames*sizeof(float)); }
         if(is_clouds_fx(fx)){
             if(sl->dsp.heavy)
                 pfx_clouds_process(fx, sl->dsp.heavy, p->L, p->R, frames,
-                                   sl->amount, sl->macro, sl->drift);
+                                   sl->amt_sm, sl->mac_sm, sl->drf_sm);
             /* heavy alloc failed → leave signal untouched (passthrough) */
         } else {
             FX_TABLE[fx].process(&sl->dsp, p->L, p->R, frames,
-                                 sl->amount, sl->macro, sl->drift);
+                                 sl->amt_sm, sl->mac_sm, sl->drf_sm);
         }
         if(ramping){
             float rr=sl->ramp;
             for(int i=0;i<frames;i++){
                 float g=rr+ramp_inc*(float)i; if(g>1.0f)g=1.0f;
+                g=g*g*(3.0f-2.0f*g);                  /* smoothstep — gentler crossfade */
                 p->L[i]=preL[i]*(1.0f-g)+p->L[i]*g;
                 p->R[i]=preR[i]*(1.0f-g)+p->R[i]*g;
             }
@@ -1353,7 +1388,7 @@ static void process_block(void *instance, int16_t *buf, int frames){
         }
     }
     /* equal-power dry/wet + write back (NaN-guarded — many effects feed back) */
-    float a=p->mix*1.5707963f, dg=cosf(a), wg=sinf(a);
+    float a=p->mix_sm*1.5707963f, dg=cosf(a), wg=sinf(a);
     for(int i=0;i<frames;i++){
         float ol=dg*dryL[i]+wg*p->L[i];
         float orr=dg*dryR[i]+wg*p->R[i];
