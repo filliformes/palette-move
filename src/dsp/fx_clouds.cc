@@ -24,14 +24,9 @@
 
 using namespace clouds;
 
-enum { FX_SPACE = 17, FX_BLOOM = 18, FX_FREEZE = 24 };  /* MUST match palette.c PFX_* */
+enum { FX_SPACE = 17, FX_BLOOM = 18 };  /* MUST match palette.c PFX_* */
 
-/* FREEZE lives in fx_spectral.cc (Signalsmith FFT) — delegated from here so
- * palette.c keeps a single heavy-dispatch interface. */
-extern "C" void *pfx_spectral_alloc(float sr);
-extern "C" void  pfx_spectral_free(void *h);
-extern "C" void  pfx_spectral_process(void *h, float *l, float *r, int n,
-                                      float amount, float macro, float drift);
+/* (FREEZE removed — replaced by the pure-C HALO resonator in palette.c.) */
 
 #define CLD_SR     44100.0f
 #define CLD_MAXBLK 128
@@ -118,7 +113,7 @@ static void bloom_process(BloomState *st, float *l, float *r, int n,
                           float amount, float macro, float drift){
     /* reverb first (lush, long) */
     st->verb.set_amount(1.0f);
-    st->verb.set_time(0.7f + macro*0.29f);
+    st->verb.set_time(0.30f + macro*0.65f);                 /* shorter at macro=0 → long bloom at max */
     st->verb.set_diffusion(0.7f);
     st->verb.set_lp(cclampf(0.55f - drift*0.2f,0.2f,0.9f));
     FloatFrame fr[CLD_MAXBLK];
@@ -154,7 +149,6 @@ extern "C" void *pfx_clouds_alloc(int fx_id, float sr){
     switch(fx_id){
         case FX_SPACE:  return (void*)space_new();
         case FX_BLOOM:  return (void*)bloom_new();
-        case FX_FREEZE: return pfx_spectral_alloc(sr);
         default:        return NULL;
     }
 }
@@ -164,7 +158,6 @@ extern "C" void pfx_clouds_free(void *heavy){
     switch(h->kind){
         case FX_SPACE:  delete (SpaceState*)heavy; break;
         case FX_BLOOM:  delete (BloomState*)heavy; break;
-        case FX_FREEZE: pfx_spectral_free(heavy); break;
         default: break;
     }
 }
@@ -174,7 +167,6 @@ extern "C" void pfx_clouds_process(int fx_id, void *heavy, float *l, float *r, i
     switch(fx_id){
         case FX_SPACE:  space_process ((SpaceState*)heavy, l,r,n,amount,macro,drift); break;
         case FX_BLOOM:  bloom_process ((BloomState*)heavy, l,r,n,amount,macro,drift); break;
-        case FX_FREEZE: pfx_spectral_process(heavy,l,r,n,amount,macro,drift); break;
         default: break;
     }
 }

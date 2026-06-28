@@ -87,7 +87,7 @@ enum {
     /* Character (group 0) */ PFX_DRIVE, PFX_SWEETEN, PFX_FUZZ, PFX_HOWL, PFX_FOLD, PFX_SWELL,
     /* Movement  (group 1) */ PFX_DOUBLER, PFX_VIBRATO, PFX_PHASER, PFX_TREMOLO, PFX_PITCH, PFX_SHIFT,
     /* Diffusion (group 2) */ PFX_CASCADE, PFX_REELS, PFX_COLLAGE, PFX_REVERSE, PFX_SPACE, PFX_BLOOM,
-    /* Texture   (group 3) */ PFX_FILTER, PFX_SQUASH, PFX_CASSETTE, PFX_BROKEN, PFX_INTERFERENCE, PFX_FREEZE,
+    /* Texture   (group 3) */ PFX_FILTER, PFX_SQUASH, PFX_CASSETTE, PFX_BROKEN, PFX_INTERFERENCE, PFX_HALO,
     PFX_COUNT               /* = 25 (Off + 24) */
 };
 #define NUM_FX (PFX_COUNT - 1)   /* 24 selectable effects */
@@ -98,7 +98,7 @@ static const char *FX_NAMES[PFX_COUNT] = {
     "Drive","Sweeten","Fuzz","Howl","Fold","Swell",
     "Doubler","Vibrato","Phaser","Tremolo","Pitch","Shift",
     "Cascade","Reels","Collage","Reverse","Space","Bloom",
-    "Filter","Squash","Cassette","Broken","Interference","Freeze"
+    "Filter","Squash","Cassette","Broken","Interference","Halo"
 };
 static const uint8_t FX_GROUP[PFX_COUNT] = {
     0, 0,0,0,0,0,0, 1,1,1,1,1,1, 2,2,2,2,2,2, 3,3,3,3,3,3
@@ -139,6 +139,8 @@ typedef struct {
     /* misc per-effect scratch */
     float  f1,f2,f3,f4,f5,f6;
     int    i1,i2,i3,i4;
+    /* HALO resonator bank: 6 voices × per-channel damping one-pole */
+    float  halo_lp_l[6], halo_lp_r[6];
     uint32_t seed;            /* per-slot deterministic RNG (drift) */
     /* tempo sync (set per block by the host): >0 = use instead of Macro mapping */
     float  sync_time;         /* synced delay time in samples (0 = free) */
@@ -171,7 +173,7 @@ typedef struct {
 
 /* heavy (Clouds-backed) effects need lazy alloc + special dispatch */
 static inline int is_clouds_fx(int id){
-    return id==PFX_SPACE || id==PFX_BLOOM || id==PFX_FREEZE;
+    return id==PFX_SPACE || id==PFX_BLOOM;
 }
 
 /* ── Instance ────────────────────────────────────────────────────────────────── */
@@ -285,21 +287,30 @@ static void fx_passthrough(slot_dsp_t *s, float *l, float *r, int n,
 
 /* ── CHARACTER ─────────────────────────────────────────────────────────────── */
 
-/* DRIVE — tube-ish overdrive. Uses super-boom-move sb_apply_dist Tube voicing
- * (asymmetric Padé tanh). amount=drive, macro=tone tilt, drift=slow bias wander. */
+/* DRIVE — tube-ish overdrive that KEEPS the low end. The bass band (<~200 Hz) is
+ * split off and passed clean; only the harmonic band is driven through the
+ * Airwindows Spiral shaper sin(x·|x|)/|x| (Chris Johnson, MIT — soft musical fold).
+ * macro = pre-emphasis tilt (brightens INTO the shaper, never high-passes the
+ * output), drift = slow bias wander. State: z1=bass one-pole. */
 static void fx_drive(slot_dsp_t *s, float *l, float *r, int n,
                      float amount, float macro, float drift){
-    float g    = 1.0f + amount*9.0f + amount*amount*36.0f; /* more bite, fine low end */
-    float tilt = (macro-0.5f)*2.0f;                 /* −1..+1 */
-    float comp = 0.85f/(0.3f+0.7f*g);               /* level compensation */
-    float tc   = 0.18f;                              /* tilt one-pole coeff */
+    float drv  = 1.0f + amount*6.0f + amount*amount*30.0f;
+    float tilt = (macro-0.5f)*2.0f;                  /* −1..+1 brightness tilt */
+    const float aBass=0.030f;                        /* ~200 Hz low/high split */
+    float himk = 0.7f + amount*0.5f;                 /* harmonic-band makeup */
     for(int i=0;i<n;i++){
-        float bias = drift>0.0f ? wander(&s->f1,&s->seed,0.0006f)*drift*0.12f : 0.0f;
-        float xl=sb_apply_dist(l[i]*g+bias,1), xr=sb_apply_dist(r[i]*g+bias,1); /* Tube */
-        s->z1l += tc*(xl-s->z1l)+DENORM; s->z1r += tc*(xr-s->z1r)+DENORM;
-        float ll = (tilt>=0.0f)? lerpf(xl,(xl-s->z1l)*2.0f,tilt) : lerpf(xl,s->z1l*1.6f,-tilt);
-        float rr = (tilt>=0.0f)? lerpf(xr,(xr-s->z1r)*2.0f,tilt) : lerpf(xr,s->z1r*1.6f,-tilt);
-        l[i]=lerpf(l[i],ll*comp,amount); r[i]=lerpf(r[i],rr*comp,amount); /* amount=0 → dry */
+        float bias = drift>0.0f ? wander(&s->f1,&s->seed,0.0006f)*drift*0.10f : 0.0f;
+        for(int ch=0;ch<2;ch++){
+            float x=(ch?r:l)[i];
+            float *lp=ch?&s->z1r:&s->z1l;
+            *lp += aBass*(x-*lp)+DENORM;
+            float bass=*lp, high=x-*lp;              /* clean sub + harmonic band */
+            float pre=high*(1.0f+0.6f*tilt)+bias;    /* tilt = pre-emphasis, not HPF */
+            float d=pre*drv, ad=fabsf(d);
+            float sh=(ad>1e-6f)? sinf(d*ad)/ad : d;  /* Spiral soft fold */
+            float wet=bass + sh*himk;                /* bass FULL → low end intact */
+            (ch?r:l)[i]=lerpf(x, wet, amount);       /* amount=0 → dry */
+        }
     }
 }
 
@@ -317,12 +328,18 @@ static void fx_sweeten(slot_dsp_t *s, float *l, float *r, int n,
         s->env += (mono>s->env?0.02f:0.004f)*(mono-s->env)+DENORM;  /* fast atk slow rel */
         float gr=1.0f; if(s->env>thr) gr=1.0f-(1.0f-thr/s->env)*ratio;
         float dl=(drift>0.0f)? 1.0f+wander(&s->f1,&s->seed,0.0004f)*drift*0.03f : 1.0f;
+        float mdrive=1.0f+amount*2.2f;                /* density drive */
+        float mcomp=1.0f/(0.55f+mdrive*0.45f);
         for(int ch=0;ch<2;ch++){
             float dry=(ch?r:l)[i];
             float x=dry*gr*dl;
-            /* Airwindows Density sin-fold saturator (level-compensated) */
-            float br=fabsf(x*(1.0f+density)); if(br>1.57079633f)br=1.57079633f; br=sinf(br);
-            float sat=((x>0.0f)? x*(1.0f-dwet)+br*dwet : x*(1.0f-dwet)-br*dwet)*comp;
+            /* Airwindows Mojo density fold (Chris Johnson, MIT): pow(|x|,0.25)
+             * thickens low-level detail before a very soft sin-fold → perceived
+             * density/RMS ("louder without clipping"), the console-glue voice. */
+            float xx=x*mdrive;
+            float mojo=sqrtf(sqrtf(fabsf(xx)+1e-9f));  /* |x|^0.25 (two sqrts) */
+            float sat=(sinf(xx*mojo*1.57079633f)/mojo)*0.987654f*mcomp;
+            (void)dwet;(void)comp;(void)density;
             /* Air-style HF tilt shelf (macro) */
             float *z=ch?&s->z1r:&s->z1l;
             *z += 0.10f*(sat-*z)+DENORM;              /* LP component */
@@ -333,21 +350,33 @@ static void fx_sweeten(slot_dsp_t *s, float *l, float *r, int n,
     }
 }
 
-/* FUZZ — high-gain asymmetric clip with bias/gate. amount=intensity,
- * macro=tone/bias, drift=bias instability. */
+/* FUZZ — Big-Muff-style TWO cascaded soft-clip stages. The cascade gives the
+ * compressed, sustaining, "singing" voice at MODERATE output (not just loud):
+ * input band-limited ~1.2 kHz → starved bias → two soft clips in series →
+ * DC-block → post tone. amount=sustain/gain, macro=tone/bias, drift=bias drift.
+ * State: z3=input LP, z4/bp=DC-block x/y, z2=tone LP. */
 static void fx_fuzz(slot_dsp_t *s, float *l, float *r, int n,
                     float amount, float macro, float drift){
-    float g=1.0f+amount*amount*42.0f;                /* tamed: was *80 (too intense) */
-    float bias=(macro-0.5f)*0.7f;                    /* macro shifts symmetry */
-    float tonec=0.08f+macro*0.5f;                    /* and post tone */
+    float sustain=0.5f+amount*amount*2.6f;           /* pre-gain into the cascade */
+    float bias=(macro-0.5f)*0.4f;                    /* starved bias → asymmetry */
+    float tone=0.12f+macro*0.5f;                     /* post tone LP */
+    const float aIn=0.157f;                          /* input LP ~1.2 kHz */
     for(int i=0;i<n;i++){
-        float b=bias + (drift>0.0f? wander(&s->f1,&s->seed,0.002f)*drift*0.4f:0.0f);
+        float b=bias + (drift>0.0f? wander(&s->f1,&s->seed,0.002f)*drift*0.3f:0.0f);
         for(int ch=0;ch<2;ch++){
-            float x=(ch?r:l)[i]*g + b;
-            float y=sb_apply_dist(x,2) - sb_apply_dist(b,2);  /* super-boom Fuzz, DC-removed */
-            float *z=ch?&s->z1r:&s->z1l;
-            *z += tonec*(y-*z)+DENORM;
-            (ch?r:l)[i]=lerpf((ch?r:l)[i],*z*0.5f,amount); /* output trim: was 0.8 (too loud) */
+            float x=(ch?r:l)[i];
+            float *ilp=ch?&s->z3r:&s->z3l;
+            *ilp += aIn*(x-*ilp)+DENORM;
+            float xi=*ilp + b;
+            float g=28.0f*sustain;
+            float s1=-sb_tanh(g*xi);                  /* stage 1 (inverts) */
+            float s2=-sb_tanh(g*0.5f*s1);             /* stage 2 cascade → sustain */
+            float *dcx=ch?&s->z4r:&s->z4l, *dcy=ch?&s->bp_r:&s->bp_l;
+            float y=s2 - *dcx + 0.9995f*(*dcy);       /* DC blocker (bias offset) */
+            *dcx=s2; *dcy=y;
+            float *tz=ch?&s->z2r:&s->z2l;
+            *tz += tone*(y-*tz)+DENORM;
+            (ch?r:l)[i]=lerpf(x, *tz*0.6f, amount);   /* moderate output; amount=0 → dry */
         }
     }
 }
@@ -359,23 +388,26 @@ static void fx_fuzz(slot_dsp_t *s, float *l, float *r, int n,
  * State per ch: lp_*=ic1eq, bp_*=ic2eq. */
 static void fx_howl(slot_dsp_t *s, float *l, float *r, int n,
                     float amount, float macro, float drift){
-    float base=120.0f*powf(40.0f,macro);             /* 120..4800 Hz */
+    float base=120.0f*powf(40.0f,macro);             /* resonant freq 120..4800 Hz (TILT) */
     float fz=base*(drift>0.0f?(1.0f+wander(&s->f1,&s->seed,0.0008f)*drift*0.5f):1.0f);
     float g=tanf(3.14159265f*clampf(fz,40.0f,9000.0f)/SR);
-    float k=1.0f-amount*0.93f;                        /* damping (1/Q) → high res near 0 */
+    float k=1.0f-amount*0.985f; if(k<0.015f)k=0.015f; /* damping → near self-oscillation */
     float a1=1.0f/(1.0f+g*(g+k)), a2=g*a1, a3=g*a2;
-    float drive=1.0f+amount*amount*12.0f;
-    float voice=0.8f+amount;
+    float drive=1.0f+amount*amount*20.0f;            /* fuzz drive feeding the resonator */
+    float voice=0.6f+amount*0.9f;
     for(int ch=0;ch<2;ch++){
         float *ic1=ch?&s->lp_r:&s->lp_l, *ic2=ch?&s->bp_r:&s->bp_l;
         float *src=ch?r:l;
         for(int i=0;i<n;i++){
-            float x=tanhf(src[i]*drive);
-            float v3=x-*ic2;
+            /* Fuzz FRONT-END: harmonic-rich excitation so the high-Q filter sings,
+             * blooms and stabs (manual: "resonant filter fuzz"), not a clean BP. */
+            float fuzz=sb_apply_dist(src[i]*drive,2);
+            float v3=fuzz-*ic2;
             float v1=a1*(*ic1)+a2*v3;
             float v2=*ic2+a2*(*ic1)+a3*v3;
             *ic1=2.0f*v1-*ic1+DENORM; *ic2=2.0f*v2-*ic2+DENORM;
-            src[i]=lerpf(src[i],tanhf(v1*voice)*0.9f,amount); /* v1 = bandpass; amount=0 → dry */
+            float bp=sb_tanh(v1*voice);              /* soft-clip resonance → self-limits, blooms */
+            src[i]=lerpf(src[i],bp*0.9f,amount);     /* amount=0 → dry */
         }
     }
 }
@@ -499,11 +531,13 @@ static void fx_phaser(slot_dsp_t *s, float *l, float *r, int n,
     for(int i=0;i<n;i++){
         s->lfo+=rate/SR; if(s->lfo>=1.0f)s->lfo-=1.0f;
         float rnd=(drift>0.0f? wander(&s->f2,&s->seed,0.01f)*drift*0.4f:0.0f);
-        float sweep=0.5f+0.5f*sinf(s->lfo*TWO_PI)+rnd;
-        float fc=200.0f*powf(16.0f,clampf(sweep,0.0f,1.0f));    /* 200 Hz .. 3.2 kHz */
-        float g=tanf(3.14159265f*clampf(fc,30.0f,12000.0f)/SR);
-        float coef=(g-1.0f)/(g+1.0f);                           /* allpass coefficient */
         for(int ch=0;ch<2;ch++){
+            /* quadrature LFO: R is 90° ahead of L → fully stereo sweep */
+            float ph=s->lfo + (ch?0.25f:0.0f); if(ph>=1.0f)ph-=1.0f;
+            float sweep=0.5f+0.5f*sinf(ph*TWO_PI)+rnd;
+            float fc=200.0f*powf(16.0f,clampf(sweep,0.0f,1.0f));/* 200 Hz .. 3.2 kHz */
+            float g=tanf(3.14159265f*clampf(fc,30.0f,12000.0f)/SR);
+            float coef=(g-1.0f)/(g+1.0f);                       /* allpass coefficient */
             float *ap=ch?s->ap_r:s->ap_l; float *fbz=ch?&s->z2r:&s->z2l;
             float x=(ch?r:l)[i]+ *fbz*fb;
             for(int k=0;k<stages;k++){
@@ -619,15 +653,17 @@ static void delay_core(slot_dsp_t *s, float *l, float *r, int n,
                        float fb_cap, float lp_amt, float wow_hz, float wow_depth,
                        float sat_drive, float flutter_depth, float hiss){
     float t=(s->sync_time>0.0f)? s->sync_time : SR*(0.03f*powf(40.0f,macro)); /* 30ms..1.2s / synced */
+    if(s->f6<1.0f || s->f6>SR*2.5f) s->f6=t;          /* init/repair smoothed time */
     float fb=amount*fb_cap;
     float wet=clampf(amount*1.4f,0.0f,1.0f);          /* amount=0 → dry */
     for(int i=0;i<n;i++){
+        s->f6 += 0.0004f*(t-s->f6);                   /* glide delay time (no zipper/click) */
         s->lfo+=wow_hz/SR;  if(s->lfo>=1.0f)s->lfo-=1.0f;     /* wow */
         s->lfo2+=6.3f/SR;   if(s->lfo2>=1.0f)s->lfo2-=1.0f;   /* flutter */
         float wob=wow_depth*sinf(s->lfo*TWO_PI)
                  + flutter_depth*sinf(s->lfo2*TWO_PI)
                  + (drift>0.0f? wander(&s->f1,&s->seed,0.001f)*drift*wow_depth*3.0f:0.0f);
-        float d=t*(1.0f+wob);
+        float d=s->f6*(1.0f+wob);
         float tapL=dlr(s->dl_l,s->wp,d), tapR=dlr(s->dl_r,s->wp,d);
         /* 2-pole LP darkening in the feedback (more = warmer/tape) */
         s->z1l+=lp_amt*(tapL-s->z1l)+DENORM; s->z2l+=lp_amt*(s->z1l-s->z2l)+DENORM;
@@ -676,18 +712,21 @@ static void fx_reverse(slot_dsp_t *s, float *l, float *r, int n,
 static void fx_collage(slot_dsp_t *s, float *l, float *r, int n,
                        float amount, float macro, float drift){
     float loop=(s->sync_time>0.0f)? s->sync_time : SR*(0.05f+macro*1.2f);
+    if(s->f5<1.0f || s->f5>SR*1.3f) s->f5=loop;       /* init/repair smoothed loop time */
     float fb=amount*0.9f;
     for(int i=0;i<n;i++){
+        s->f5 += 0.0004f*(loop-s->f5);                /* glide loop time (no distortion on knob turn) */
+        float lps=s->f5;
         /* grain scheduler: f3=grain pos, f4=grain speed, i1=samples left */
         if(s->i1<=0){
             s->i1=(int)(SR*(0.04f+frand(&s->seed)*0.12f));
             s->f4=1.0f;
             if(drift>0.0f && frand(&s->seed)<drift*0.5f) s->f4=(frand(&s->seed)<0.5f?2.0f:-1.0f);
-            s->f3=frand(&s->seed)*loop;
+            s->f3=frand(&s->seed)*lps;
         }
         s->i1--;
-        s->f3+=s->f4; if(s->f3<0)s->f3+=loop; if(s->f3>=loop)s->f3-=loop;
-        float gL=dlr(s->dl_l,s->wp,loop-s->f3), gR=dlr(s->dl_r,s->wp,loop-s->f3);
+        s->f3+=s->f4; if(s->f3<0)s->f3+=lps; if(s->f3>=lps)s->f3-=lps;
+        float gL=dlr(s->dl_l,s->wp,lps-s->f3), gR=dlr(s->dl_r,s->wp,lps-s->f3);
         s->dl_l[s->wp]=l[i]+gL*fb; s->dl_r[s->wp]=r[i]+gR*fb;
         s->wp=(s->wp+1)%MAX_DELAY;
         l[i]=lerpf(l[i],gL,amount*0.9f); r[i]=lerpf(r[i],gR,amount*0.9f);
@@ -813,23 +852,23 @@ static void fx_cassette(slot_dsp_t *s, float *l, float *r, int n,
  * macro=rate of failures, drift=dropout randomness. */
 static void fx_broken(slot_dsp_t *s, float *l, float *r, int n,
                       float amount, float macro, float drift){
-    float rate=0.1f+macro*macro*3.0f;                /* failure LFO Hz */
-    float base=SR*0.01f;
+    float rate=0.1f+macro*macro*3.0f;                /* motor failure LFO Hz */
     for(int i=0;i<n;i++){
         s->lfo+=rate/SR; if(s->lfo>=1.0f)s->lfo-=1.0f;
-        /* sawtooth-ish motor slowdown: pitch dips then snaps back */
+        /* periodic motor stall: read offset is ~0 at rest (so wet≈dry, NO doubling)
+         * and grows during the dip (pitch drops, then recovers each cycle). */
         float dip=amount*(0.5f-0.5f*cosf(s->lfo*TWO_PI));
-        float vs=1.0f-dip*0.6f;                       /* varispeed read rate */
         s->dl_l[s->wp]=l[i]; s->dl_r[s->wp]=r[i];
-        float rd=base*(2.0f-vs);                        /* slow read = lower pitch */
+        float rd=3.0f + dip*SR*0.03f                  /* baseline ~0 + up to ~30 ms drop */
+               + (drift>0.0f? (0.5f+0.5f*sinf(s->lfo*TWO_PI*1.7f))*drift*SR*0.003f : 0.0f);
         float xL=dlr(s->dl_l,s->wp,rd), xR=dlr(s->dl_r,s->wp,rd);
         s->wp=(s->wp+1)%MAX_DELAY;
-        /* dropout gate */
-        if(drift>0.0f && frand(&s->seed)<drift*0.002f) s->i1=(int)(SR*0.02f*frand(&s->seed));
-        float gate=1.0f; if(s->i1>0){ s->i1--; gate=0.0f; }
-        /* AM wobble */
-        float am=1.0f-amount*0.3f*(0.5f-0.5f*cosf(s->lfo*TWO_PI*2.0f));
-        l[i]=lerpf(l[i],xL*gate*am,amount); r[i]=lerpf(r[i],xR*gate*am,amount);
+        /* DRIFT = occasional SMOOTHED dropouts (gate ramps → no clicks) + the warble above */
+        if(drift>0.0f && frand(&s->seed)<drift*0.0004f) s->i1=(int)(SR*0.05f*frand(&s->seed));
+        float gtarget=1.0f; if(s->i1>0){ s->i1--; gtarget=0.0f; }
+        s->f3 += 0.012f*(gtarget - s->f3) + DENORM;   /* ~3 ms gate ramp */
+        float am=1.0f-amount*0.3f*(0.5f-0.5f*cosf(s->lfo*TWO_PI*2.0f));   /* AM wobble */
+        l[i]=lerpf(l[i],xL*s->f3*am,amount); r[i]=lerpf(r[i],xR*s->f3*am,amount);
     }
 }
 
@@ -841,9 +880,12 @@ static void fx_broken(slot_dsp_t *s, float *l, float *r, int n,
 static void fx_interference(slot_dsp_t *s, float *l, float *r, int n,
                             float amount, float macro, float drift){
     float A=clampf(amount,0.0f,1.0f);
-    float targetA=A*A*A+0.0005f; if(targetA>1.0f)targetA=1.0f;
+    /* crush scales WITH amount (was inverted → heavy crush + noise at low amounts).
+     * targetA = sample-rate increment: ~1 (clean) at A=0 → 0.03 (heavy SR reduction) at A=1.
+     * targetB = bit-quant step: 0 (no quantize) at A=0 → coarse at A=1. */
+    float targetA=1.0f - A*0.97f; if(targetA<0.03f)targetA=0.03f;
     float soften=(1.0f+targetA)/2.0f;
-    float targetB=powf(1.0f-A,3.0f)/3.0f;             /* bit depth derez */
+    float targetB=A*A*0.33f;                          /* bit-depth derez (scales up with amount) */
     float hard=0.45f;                                 /* more dry blend = less harsh */
     float carr=200.0f+macro*macro*3000.0f;
     const float L256=logf(256.0f);
@@ -890,6 +932,46 @@ static void fx_interference(slot_dsp_t *s, float *l, float *r, int n,
     }
 }
 
+/* HALO — ethereal harmonic resonator pad (Walrus Qi / OBNE Dark-Star vibe).
+ * A 6-voice Karplus-Strong / tuned-comb bank: the chain audio sympathetically
+ * excites delay lines tuned to a chord (root, 5th, oct, +oct-3rd, +oct-5th, 2-oct),
+ * each with a damping one-pole and soft-clipped feedback so they ring/bloom into a
+ * frozen harmonic drone. Pure C (replaces the FFT FREEZE). amount = resonance/
+ * sustain (feedback), macro = root pitch + brightness, drift = per-voice detune.
+ * Comb buffers reuse dl_l/dl_r (6 regions × 1024); shared region index = i1;
+ * per-voice damping = halo_lp_l/r; drift walk = f1. */
+#define HALO_VLEN 1024
+static void fx_halo(slot_dsp_t *s, float *l, float *r, int n,
+                    float amount, float macro, float drift){
+    static const float ratio[6]={1.0f,1.49831f,2.0f,2.51984f,2.99661f,4.0f}; /* R 5 8ve +M3 +5 +2-8ve */
+    float root=55.0f*powf(2.0f,macro*2.0f);          /* 55..220 Hz root (A1..A3) */
+    float fb=0.90f+amount*0.099f;                     /* 0.90..0.999 ring time */
+    float damp=0.12f+macro*0.55f;                     /* brighter as macro rises */
+    float exc=amount*0.5f;                            /* excitation into the bank */
+    for(int i=0;i<n;i++){
+        float drf=(drift>0.0f)? wander(&s->f1,&s->seed,0.0006f)*drift*0.012f : 0.0f;
+        for(int ch=0;ch<2;ch++){
+            float *buf=ch?s->dl_r:s->dl_l;
+            float *lp =ch?s->halo_lp_r:s->halo_lp_l;
+            float in=(ch?r:l)[i];
+            float sum=0.0f;
+            for(int v=0;v<6;v++){
+                float dl=(SR/(root*ratio[v]))*(1.0f+drf*(float)v);
+                if(dl>HALO_VLEN-2) dl=HALO_VLEN-2; if(dl<2.0f) dl=2.0f;
+                float *vb=buf+v*HALO_VLEN;
+                float rp=(float)s->i1-dl; while(rp<0.0f) rp+=HALO_VLEN;
+                int i0=(int)rp; float fr=rp-(float)i0; int i1n=i0+1; if(i1n>=HALO_VLEN)i1n=0;
+                float y=vb[i0]+(vb[i1n]-vb[i0])*fr;
+                lp[v]+=damp*(y-lp[v])+DENORM;          /* loop damping */
+                vb[s->i1]=in*exc + sb_tanh(lp[v]*fb);  /* excite + soft-clipped regen */
+                sum+=y;
+            }
+            (ch?r:l)[i]=lerpf(in, sum*0.32f, amount);  /* amount=0 → dry */
+        }
+        s->i1++; if(s->i1>=HALO_VLEN) s->i1=0;
+    }
+}
+
 /* ── Vtable: index by PFX_* id. OFF has no entry (host skips). ───────────────── */
 static const palette_effect_t FX_TABLE[PFX_COUNT] = {
     [PFX_OFF]          = { fx_passthrough,   NULL },
@@ -916,7 +998,7 @@ static const palette_effect_t FX_TABLE[PFX_COUNT] = {
     [PFX_CASSETTE]     = { fx_cassette,      NULL },
     [PFX_BROKEN]       = { fx_broken,        NULL },
     [PFX_INTERFERENCE] = { fx_interference,  NULL },
-    [PFX_FREEZE]       = { fx_passthrough,   NULL },  /* Clouds (heavy) — dispatched specially */
+    [PFX_HALO]         = { fx_halo,          NULL },  /* pure-C resonator pad (replaces FFT Freeze) */
 };
 
 /* Clear all per-effect scratch on switch. Preserves the delay-line allocation,
@@ -1020,12 +1102,12 @@ typedef struct {
 #define NUM_PRESETS 50
 static const preset_t PRESETS[NUM_PRESETS] = {
 {"Init",           {PFX_DRIVE,PFX_DOUBLER,PFX_CASCADE,PFX_FILTER},    {0,0,0,50}, {50,40,45,30}, {0,0,0,0}, 100,100,0},
-{"Delay + Verb",   {PFX_CASCADE,PFX_SPACE,PFX_VIBRATO,PFX_FREEZE},    {50,45,0,0}, {45,55,50,50}, {12,8,0,0}, 100,100,0},
+{"Delay + Verb",   {PFX_CASCADE,PFX_SPACE,PFX_VIBRATO,PFX_HALO},    {50,45,0,0}, {45,55,50,50}, {12,8,0,0}, 100,100,0},
 {"Tape Echo",      {PFX_REELS,PFX_SHIFT,PFX_SWELL,PFX_COLLAGE},       {50,0,0,0}, {45,50,50,50}, {18,0,0,0}, 100,100,0},
 {"Concert Hall",   {PFX_SPACE,PFX_CASSETTE,PFX_HOWL,PFX_PITCH},       {55,0,0,0}, {70,50,50,50}, {8,0,0,0}, 100,100,0},
 {"Plate Shimmer",  {PFX_BLOOM,PFX_SQUASH,PFX_BROKEN,PFX_INTERFERENCE},{50,0,0,0}, {55,50,50,50}, {10,0,0,0}, 100,100,0},
 {"Doubler Width",  {PFX_DOUBLER,PFX_TREMOLO,PFX_SPACE,PFX_REELS},     {55,0,0,0}, {40,50,50,50}, {12,0,0,0}, 100,100,0},
-{"Slapback",       {PFX_DOUBLER,PFX_CASCADE,PFX_FREEZE,PFX_PHASER},   {50,35,0,0}, {35,30,50,50}, {10,10,0,0}, 100,100,0},
+{"Slapback",       {PFX_DOUBLER,PFX_CASCADE,PFX_HALO,PFX_PHASER},   {50,35,0,0}, {35,30,50,50}, {10,10,0,0}, 100,100,0},
 {"Warm Drive",     {PFX_DRIVE,PFX_SWELL,PFX_COLLAGE,PFX_FUZZ},        {45,0,0,0}, {55,50,50,50}, {8,0,0,0}, 100,100,0},
 {"Console Glue",   {PFX_SWEETEN,PFX_SQUASH,PFX_HOWL,PFX_PITCH},       {45,40,0,0}, {55,50,50,50}, {6,8,0,0}, 100,100,0},
 {"Vibrato Verb",   {PFX_VIBRATO,PFX_SPACE,PFX_BROKEN,PFX_INTERFERENCE},{35,45,0,0}, {35,60,50,50}, {15,8,0,0}, 100,100,0},
@@ -1044,31 +1126,31 @@ static const preset_t PRESETS[NUM_PRESETS] = {
 {"Lo-fi Tape",     {PFX_CASSETTE,PFX_REELS,PFX_REVERSE,PFX_HOWL},     {55,45,0,0}, {40,50,50,50}, {30,18,0,0}, 100,100,0},
 {"Squash Drive",   {PFX_SQUASH,PFX_DRIVE,PFX_FILTER,PFX_BROKEN},      {55,40,50,0}, {50,55,30,50}, {10,8,0,0}, 100,100,0},
 {"Reverse Bloom",  {PFX_REVERSE,PFX_BLOOM,PFX_DRIVE,PFX_DOUBLER},     {50,50,0,0}, {45,65,50,50}, {12,12,0,0}, 100,100,0},
-{"Fold Space",     {PFX_FOLD,PFX_SPACE,PFX_VIBRATO,PFX_FREEZE},       {45,50,0,0}, {55,60,50,50}, {12,8,0,0}, 100,95,0},
+{"Fold Space",     {PFX_FOLD,PFX_SPACE,PFX_VIBRATO,PFX_HALO},       {45,50,0,0}, {55,60,50,50}, {12,8,0,0}, 100,95,0},
 {"Shift Bloom",    {PFX_SHIFT,PFX_BLOOM,PFX_SWELL,PFX_COLLAGE},       {40,55,0,0}, {58,70,50,50}, {12,12,0,0}, 100,100,0},
 {"Dub Filter",     {PFX_FILTER,PFX_REELS,PFX_CASSETTE,PFX_HOWL},      {30,50,0,0}, {55,55,50,50}, {8,20,0,0}, 100,100,0},
 {"Ambient Swell",  {PFX_SWELL,PFX_BLOOM,PFX_SQUASH,PFX_BROKEN},       {65,55,0,0}, {50,72,50,50}, {8,15,0,0}, 100,100,0},
 {"Vibe Drive Vrb", {PFX_VIBRATO,PFX_DRIVE,PFX_SPACE,PFX_DOUBLER},     {35,40,45,0}, {35,55,55,50}, {15,8,8,0}, 100,100,0},
-{"Tape Phaser",    {PFX_PHASER,PFX_CASSETTE,PFX_FREEZE,PFX_BLOOM},    {50,45,0,0}, {45,45,50,50}, {12,22,0,0}, 100,100,0},
+{"Tape Phaser",    {PFX_PHASER,PFX_CASSETTE,PFX_HALO,PFX_BLOOM},    {50,45,0,0}, {45,45,50,50}, {12,22,0,0}, 100,100,0},
 {"Crush Verb",     {PFX_INTERFERENCE,PFX_SPACE,PFX_SWELL,PFX_COLLAGE},{40,50,0,0}, {45,60,50,50}, {18,8,0,0}, 100,100,0},
 {"Grain Hall",     {PFX_COLLAGE,PFX_SPACE,PFX_HOWL,PFX_PITCH},        {45,55,0,0}, {50,65,50,50}, {20,8,0,0}, 100,100,0},
 {"Octave Drive",   {PFX_SHIFT,PFX_DRIVE,PFX_SPACE,PFX_BROKEN},        {35,40,45,0}, {60,55,55,50}, {10,8,8,0}, 100,95,0},
 {"Broken Radio",   {PFX_BROKEN,PFX_INTERFERENCE,PFX_TREMOLO,PFX_SPACE},{45,45,0,0}, {40,45,50,50}, {25,30,0,0}, 95,100,0},
-{"Freeze Reels",   {PFX_FREEZE,PFX_REELS,PFX_PHASER,PFX_BLOOM},       {60,40,0,0}, {50,45,50,50}, {20,18,0,0}, 100,100,0},
-{"Glitch Cloud",   {PFX_COLLAGE,PFX_FREEZE,PFX_SPACE,PFX_FUZZ},       {50,50,45,0}, {45,55,60,50}, {28,18,8,0}, 100,100,0},
-{"Intf Freeze",    {PFX_INTERFERENCE,PFX_FREEZE,PFX_PITCH,PFX_SWEETEN},{45,55,0,0}, {45,55,50,50}, {28,18,0,0}, 100,100,0},
+{"Halo Reels",   {PFX_HALO,PFX_REELS,PFX_PHASER,PFX_BLOOM},       {60,40,0,0}, {50,45,50,50}, {20,18,0,0}, 100,100,0},
+{"Glitch Cloud",   {PFX_COLLAGE,PFX_HALO,PFX_SPACE,PFX_FUZZ},       {50,50,45,0}, {45,55,60,50}, {28,18,8,0}, 100,100,0},
+{"Intf Halo",    {PFX_INTERFERENCE,PFX_HALO,PFX_PITCH,PFX_SWEETEN},{45,55,0,0}, {45,55,50,50}, {28,18,0,0}, 100,100,0},
 {"Reverse Shift",  {PFX_REVERSE,PFX_SHIFT,PFX_INTERFERENCE,PFX_FOLD}, {50,40,0,0}, {45,60,50,50}, {15,15,0,0}, 100,100,0},
 {"Fold Fuzz",      {PFX_FOLD,PFX_FUZZ,PFX_SPACE,PFX_REELS},           {45,40,0,0}, {55,45,50,50}, {15,18,0,0}, 100,90,0},
 {"Broken Tape",    {PFX_BROKEN,PFX_CASSETTE,PFX_BLOOM,PFX_CASCADE},   {45,50,0,0}, {40,45,50,50}, {25,30,0,0}, 100,100,0},
 {"Crush Bloom",    {PFX_INTERFERENCE,PFX_BLOOM,PFX_FUZZ,PFX_REVERSE}, {40,55,0,0}, {50,70,50,50}, {20,15,0,0}, 100,100,0},
 {"Stutter Verb",   {PFX_COLLAGE,PFX_REVERSE,PFX_SPACE,PFX_SWEETEN},   {50,45,45,0}, {45,50,60,50}, {28,15,8,0}, 100,100,0},
-{"Howl Freeze",    {PFX_HOWL,PFX_FREEZE,PFX_FOLD,PFX_DRIVE},          {50,55,0,0}, {55,50,50,50}, {20,18,0,0}, 100,95,0},
+{"Howl Halo",    {PFX_HOWL,PFX_HALO,PFX_FOLD,PFX_DRIVE},          {50,55,0,0}, {55,50,50,50}, {20,18,0,0}, 100,95,0},
 {"Warble Shift",   {PFX_CASSETTE,PFX_SHIFT,PFX_REELS,PFX_VIBRATO},    {55,40,0,0}, {45,58,50,50}, {35,15,0,0}, 100,100,0},
-{"Ghost Pitch",    {PFX_PITCH,PFX_FREEZE,PFX_BLOOM,PFX_CASCADE},      {45,55,50,0}, {70,50,70,50}, {15,18,12,0}, 100,100,0},
+{"Ghost Pitch",    {PFX_PITCH,PFX_HALO,PFX_BLOOM,PFX_CASCADE},      {45,55,50,0}, {70,50,70,50}, {15,18,12,0}, 100,100,0},
 {"Full Chain",     {PFX_DRIVE,PFX_PHASER,PFX_REELS,PFX_SPACE},        {40,45,45,40}, {50,50,45,55}, {8,12,12,8}, 100,95,0},
-{"Ambient Wash",   {PFX_SWELL,PFX_SHIFT,PFX_BLOOM,PFX_FREEZE},        {60,40,55,45}, {50,60,70,55}, {8,12,12,18}, 100,100,0},
-{"Chaos Engine",   {PFX_FOLD,PFX_BROKEN,PFX_COLLAGE,PFX_FREEZE},      {45,45,50,50}, {50,45,50,55}, {15,25,25,18}, 95,90,0},
-{"Total Destroy",  {PFX_FUZZ,PFX_INTERFERENCE,PFX_BROKEN,PFX_FREEZE}, {50,45,45,50}, {45,45,40,55}, {20,28,28,20}, 90,90,0},
+{"Ambient Wash",   {PFX_SWELL,PFX_SHIFT,PFX_BLOOM,PFX_HALO},        {60,40,55,45}, {50,60,70,55}, {8,12,12,18}, 100,100,0},
+{"Chaos Engine",   {PFX_FOLD,PFX_BROKEN,PFX_COLLAGE,PFX_HALO},      {45,45,50,50}, {50,45,50,55}, {15,25,25,18}, 95,90,0},
+{"Total Destroy",  {PFX_FUZZ,PFX_INTERFERENCE,PFX_BROKEN,PFX_HALO}, {50,45,45,50}, {45,45,40,55}, {20,28,28,20}, 90,90,0},
 };
 
 /* Apply a factory preset: heavy-aware select for all 4 slots, then snap params. */

@@ -82,7 +82,7 @@ Chroma. Columns are **Amount · Macro · Drift**.
 | **Cassette** | degrade | tone | warble depth | wow + flutter + tape comp + sat |
 | **Broken** | breakdown | rate | dropout randomness | motor-failure + AM/FM |
 | **Interference** | crush | carrier / tone | static | Airwindows DeRez2 |
-| **Freeze** ★ | freeze | spectral blur | spectral drift | Signalsmith FFT spectral freeze |
+| **Halo** ★ | resonance / sustain | root + brightness | voice detune | Karplus harmonic resonator pad (Qi / Dark-Star vibe) |
 
 All real DSP — see [vendor/SOURCES.md](vendor/SOURCES.md) for the per-effect sourcing record
 (Mutable Clouds/Warps, Airwindows, Signalsmith, and re-voiced kernels from the Filliformes Move
@@ -130,8 +130,8 @@ Drift**, all across the four slots.
 **[INSTALL.md](INSTALL.md)** — a 30-second SSH side-load, no Docker or module store needed.
 
 **Architecture:** host + 21 pure-C effects in `src/dsp/palette.c`; the three Clouds effects in
-`src/dsp/fx_clouds.cc`; the spectral Freeze in `src/dsp/fx_spectral.cc`; authentic Warps lookup
-tables in `src/dsp/warps_data.c`. See [CLAUDE.md](CLAUDE.md) for the full build notes.
+`src/dsp/fx_clouds.cc`; authentic Warps lookup tables in `src/dsp/warps_data.c`. See
+[CLAUDE.md](CLAUDE.md) for the full build notes.
 
 ---
 

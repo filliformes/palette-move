@@ -19,10 +19,9 @@ Processes `audio_inout` (the chain signal at this slot), stereo, 44100 Hz, 128 f
 - `src/dsp/palette.c` — host + all 21 pure-C effects (slot dispatch in FX-Reorder order,
   `palette_effect_t` vtable, 25-way Skip-walk Select, 6 randomizers, 25 presets, state
   round-trip, page-aware knob overlay, equal-power Mix, ui_hierarchy getter). API typedefs
-  inline. All 24 effects implemented (SPACE/BLOOM/FREEZE dispatched to the C++ TUs below).
+  inline. All 24 effects implemented (SPACE/BLOOM dispatched to the C++ TU below; HALO is pure C).
 - `src/dsp/fx_clouds.cc` — SPACE/BLOOM (Mutable Clouds `reverb.h`), C++, `-Ivendor/clouds_engine`.
-  Routes FREEZE to fx_spectral.cc. Opaque `extern "C"` heavy interface; palette.c holds a void*.
-- `src/dsp/fx_spectral.cc` — FREEZE (Signalsmith `WindowedFFT` spectral OLA), `-Ivendor/signalsmith`.
+  Opaque `extern "C"` heavy interface; palette.c holds a void*.
 - `src/dsp/warps_data.c` — authentic Warps `lut_bipolar_fold` + `lut_ap_poles` (plain C arrays,
   MIT) for FOLD/SHIFT. No Warps engine compiled (avoids the Warps↔Clouds stmlib ODR clash).
 - `src/dsp/audio_fx_api_v2.h`, `plugin_api_v1.h` — canonical ABI headers (reference; palette.c
@@ -33,7 +32,7 @@ Processes `audio_inout` (the chain signal at this slot), stereo, 44100 Hz, 128 f
 - `module.json` — root copy, **kept in sync** with src/module.json.
 - `scripts/build.sh` — Windows/MSYS-safe Docker ARM64 build (docker create + docker cp).
   Compiles `.c` (gcc) + `.cc` (g++, `-Ivendor/clouds_engine -Ivendor/signalsmith`), links g++.
-  **4 TUs:** palette.c, warps_data.c, fx_clouds.cc, fx_spectral.cc.
+  **3 TUs:** palette.c, warps_data.c, fx_clouds.cc.
 - `scripts/install.sh` — flat SCP to `ableton@move.local`.
 - `scripts/Dockerfile` — aarch64 toolchain (gcc + g++ + dos2unix).
 - `.github/workflows/release.yml` — CI: version check, C/C++ build, release, release.json.
@@ -46,10 +45,10 @@ enum options identical.
 - **Character:** Drive, Sweeten, Fuzz, Howl, Swell, **Fold**★
 - **Movement:** Doubler, Vibrato, Phaser, Tremolo, Pitch, **Shift**★
 - **Diffusion:** Cascade, Reels, Space, Collage, Reverse, **Bloom**★
-- **Texture:** Filter, Squash, Cassette, Broken, Interference, **Freeze**★
+- **Texture:** Filter, Squash, Cassette, Broken, Interference, **Halo**★
 
 ★ = the 4 new originals (not in the Chroma): FOLD (West-Coast wavefolder), SHIFT (Bode
-linear frequency shifter), BLOOM (granular shimmer reverb), FREEZE (spectral magnitude freeze).
+linear frequency shifter), BLOOM (granular shimmer reverb), HALO (Karplus harmonic resonator pad, Qi/Dark-Star vibe).
 
 ## DSP sourcing map — AS BUILT
 **`vendor/SOURCES.md` is the authoritative per-effect record.** Summary of what each effect
@@ -57,7 +56,7 @@ actually uses (13/24 on genuinely fetched/ported OSS, 11 original C):
 - **Sibling kernels (verbatim, MIT):** DRIVE/FUZZ ← super-boom `sb_apply_dist`; CASCADE/REELS ←
   krautdrums `delay_saturate`; CASSETTE ← mello `tape_cubic`/`tape_asym`.
 - **Mutable Clouds (compiled, `fx_clouds.cc`):** SPACE = `reverb.h`; BLOOM = `reverb.h` + shimmer.
-- **Signalsmith FFT (`fx_spectral.cc`):** FREEZE = `WindowedFFT` spectral OLA magnitude-freeze.
+- **HALO (pure C, palette.c):** 6-voice Karplus-Strong tuned-comb resonator bank (octave+fifth+third), replaces the old FFT FREEZE.
 - **Airwindows (ported per-sample, MIT):** SQUASH ← Pressure4; FILTER ← Capacitor; INTERFERENCE ← DeRez2.
 - **Mutable Warps DATA (`warps_data.c`, no engine compiled):** FOLD ← `lut_bipolar_fold`;
   SHIFT ← `lut_ap_poles` 17-pole QuadratureTransform. (Warps engine NOT compiled — its stmlib

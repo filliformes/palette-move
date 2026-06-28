@@ -192,7 +192,7 @@
           "Cassette",
           "Broken",
           "Interference",
-          "Freeze"
+          "Halo"
         ]
       },
       {
@@ -248,7 +248,7 @@
           "Cassette",
           "Broken",
           "Interference",
-          "Freeze"
+          "Halo"
         ]
       },
       {
@@ -304,7 +304,7 @@
           "Cassette",
           "Broken",
           "Interference",
-          "Freeze"
+          "Halo"
         ]
       },
       {
@@ -360,7 +360,7 @@
           "Cassette",
           "Broken",
           "Interference",
-          "Freeze"
+          "Halo"
         ]
       },
       {
@@ -443,15 +443,15 @@
           "33 Grain Hall",
           "34 Octave Drive",
           "35 Broken Radio",
-          "36 Freeze Reels",
+          "36 Halo Reels",
           "37 Glitch Cloud",
-          "38 Intf Freeze",
+          "38 Intf Halo",
           "39 Reverse Shift",
           "40 Fold Fuzz",
           "41 Broken Tape",
           "42 Crush Bloom",
           "43 Stutter Verb",
-          "44 Howl Freeze",
+          "44 Howl Halo",
           "45 Warble Shift",
           "46 Ghost Pitch",
           "47 Full Chain",

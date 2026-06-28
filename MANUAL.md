@@ -95,9 +95,9 @@ Grouped only for organisation; any effect fits any slot. Each row lists **Amount
 | **Cassette** | degrade · tone · warble depth | wow + flutter + tape compression + saturation |
 | **Broken** | breakdown · rate · dropout randomness | motor-failure pitch drops + AM/FM |
 | **Interference** | crush · carrier/tone · static | telecom/radio bit-crush (Airwindows DeRez2) |
-| **Freeze** ★ | freeze · spectral blur · spectral drift | true spectral magnitude freeze (Signalsmith FFT) |
+| **Halo** ★ | resonance/sustain · root + brightness · voice detune | ethereal harmonic resonator pad — Karplus chord bank (Walrus Qi / OBNE Dark-Star vibe) |
 
-★ = the four originals not in the Chroma: **Fold, Shift, Bloom, Freeze**.
+★ = the four originals not in the Chroma: **Fold, Shift, Bloom, Halo**.
 
 ---
 
@@ -144,8 +144,8 @@ Filter**, all transparent by default (Filter centred/open), ready to dial in.
 
 - Keep four effects loaded at 0% and ride the **Amount** knobs on the PALETTE console — that's
   the Chroma performance feel.
-- **Tremolo Drift = AutoPan**, **Filter** is a DJ HP/LP sweep, **Freeze** holds a spectral
-  cloud — all great for hands-on moves.
+- **Tremolo Drift = AutoPan**, **Filter** is a DJ HP/LP sweep, **Halo** rings out a tuned
+  harmonic chord pad — all great for hands-on moves.
 - A touch of **GLOBAL → Feedback** turns any delay/reverb into a self-building texture; back it
   off before it runs away.
 - Use **Rnd Effect** to discover combinations, then tweak.
@@ -168,7 +168,7 @@ Or grab the release tarball, unpack into
 
 This is shared for the Schwung community's input. Especially curious about:
 
-- **Which effects need re-voicing?** Levels, character, the four originals (Fold/Shift/Bloom/Freeze).
+- **Which effects need re-voicing?** Levels, character, the four originals (Fold/Shift/Bloom/Halo).
 - **Performance layer** — is a global Feedback + tempo sync the right direction, or would you
   rather have pad control (momentary freeze/capture, scene launch), an A/B morph, CV-style
   expression, etc.?

@@ -18,7 +18,7 @@ table is authoritative — the per-effect "plan" further down is historical.
 | CASSETTE | ported | mello-move `tape_cubic`/`tape_asym` (sibling, MIT) |
 | SPACE | ported | Mutable **Clouds** `reverb.h` (MIT) — `fx_clouds.cc` |
 | BLOOM | ported+orig | Clouds `reverb.h` + original shimmer regeneration — `fx_clouds.cc` |
-| FREEZE | ported | **Signalsmith** `WindowedFFT` spectral OLA (MIT) — `fx_spectral.cc` |
+| HALO | original C | 6-voice Karplus-Strong tuned-comb resonator bank (palette.c), inspired by Walrus Qi / OBNE Dark-Star. Replaced the former Signalsmith FFT FREEZE. |
 | FILTER | ported | Airwindows **Capacitor** pole recurrence (MIT) |
 | SQUASH | ported | Airwindows **Pressure4** vari-mu comp (MIT) |
 | INTERFERENCE | ported | Airwindows **DeRez2** rate/µ-law/bit crush (MIT) + orig ring-mod |
@@ -150,9 +150,9 @@ out = Interpolate(lut_bipolar_fold + 2048, sum, kScale);   // bipolar fold LUT, 
 | **Cassette** | `mello-move` `apply_tape_stage` (L1253, per-style sat) + `krautdrums-move` wow/flutter | wow/flutter/degrade. macro=tone, drift=warble depth. |
 | **Broken** | from scratch: periodic pitch-drop LFO + dropout gate + AM/FM; Airwindows `Desk` ref | motor-failure. amount=breakdown, macro=rate. |
 | **Interference** | from scratch: bitcrush + noise + ring-mod; Airwindows `DeRez`/`Crunch`, ELSE `crackle~` ref | telecom/radio static. macro=tone, drift=static randomness. |
-| **Freeze** ★ | `vendor/clouds_engine` `clouds/dsp/pvoc/{phase_vocoder,stft,frame_transformation}.cc` + `stmlib/fft/shy_fft.h` | spectral magnitude freeze/smear. Heaviest effect (FFT). amount=freeze/smear, macro=spectral blur, drift=spectral drift. See /move "Spectral/PaulStretch pitfalls" lessons. |
+| **Halo** ★ | original C (`fx_halo` in palette.c); resonator algorithm per Mutable Rings KS / CCRMA Karplus-Strong (MIT, reimplemented) | tuned-comb chord bank (root+5th+oct+M3+5+2oct), soft-clipped feedback, sympathetic excitation. amount=resonance/sustain, macro=root+brightness, drift=voice detune. |
 
-★ = the 4 new originals (FOLD, SHIFT, BLOOM, FREEZE) + SPACE's lush reverb.
+★ = the 4 new originals (FOLD, SHIFT, BLOOM, HALO) + SPACE's lush reverb.
 
 ---
 
