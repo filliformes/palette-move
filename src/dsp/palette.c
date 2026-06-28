@@ -186,6 +186,7 @@ typedef struct {
     int    current_preset;    /* 1..50 */
     int    current_level;     /* page-aware knob overlay (see LEVELS) */
     uint32_t rng;
+    uint32_t ent;             /* live entropy pool (stirred from audio + sample_pos) */
     /* ── GLOBAL page ─────────────────────────────────────────────── */
     float  feedback, fb_sm;   /* global feedback send 0..1 (smoothed) */
     int    tempo_src;         /* 0 = Move (host clock), 1 = Int */
@@ -1194,6 +1195,7 @@ static void *create_instance(const char *module_dir, const char *json){
     p->current_preset = 1;
     p->current_level = 1;                       /* LV_PALETTE — landing mirrors Console knobs */
     p->rng = 0x12345678u;
+    p->ent = 0xB5297A4Du;                        /* nonzero so the xorshift pool churns */
     load_preset(p, 1);                          /* start on Init (Drive→Doubler→Cascade→Filter) */
     if(g_host && g_host->log) g_host->log("[palette] instance created");
     return p;
@@ -1255,6 +1257,11 @@ static float get_float_key(palette_t *p, const char *key){
 }
 
 static void fire_trigger(palette_t *p, const char *key){
+    /* fold accumulated audio entropy + exact tap timing into the RNG so each press
+     * is genuinely random (the base seed alone would replay the same sequence). */
+    p->rng ^= p->ent + p->sample_pos*2654435761u + 0x9e3779b9u;
+    p->rng = p->rng*1664525u + 1013904223u;
+    if(p->rng==0u) p->rng=0x9e3779b9u;
     if(!strcmp(key,"rnd_patch"))  rnd_patch(p);
     else if(!strcmp(key,"rnd_effect")) rnd_effect(p);
     else if(!strcmp(key,"rnd_amount")) rnd_amount(p);
@@ -1557,6 +1564,15 @@ static void process_block(void *instance, int16_t *buf, int frames){
         sync_rate=1.0f/tsec;
     }
     p->sample_pos += (uint32_t)frames;
+    /* stir the entropy pool from the LIVE audio (never identical) + sample counter,
+     * so the randomizers are truly non-deterministic (not a fixed seeded sequence). */
+    if(frames>0){
+        uint32_t e = p->ent ^ p->sample_pos
+                   ^ ((uint32_t)(uint16_t)buf[0])
+                   ^ ((uint32_t)(uint16_t)buf[2*frames-1] << 16);
+        e ^= e<<13; e ^= e>>17; e ^= e<<5;            /* xorshift mix */
+        p->ent = e;
+    }
 
     /* de-interleave + input volume + global feedback send (damped + soft-clipped) */
     float dryL[MAXFRAMES], dryR[MAXFRAMES];
