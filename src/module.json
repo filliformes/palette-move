@@ -498,7 +498,8 @@
         "options": [
           "0",
           "1"
-        ]
+        ],
+        "access": "write"
       },
       {
         "key": "rnd_effect",
@@ -507,7 +508,8 @@
         "options": [
           "0",
           "1"
-        ]
+        ],
+        "access": "write"
       },
       {
         "key": "rnd_amount",
@@ -516,7 +518,8 @@
         "options": [
           "0",
           "1"
-        ]
+        ],
+        "access": "write"
       },
       {
         "key": "rnd_macro",
@@ -525,7 +528,8 @@
         "options": [
           "0",
           "1"
-        ]
+        ],
+        "access": "write"
       },
       {
         "key": "rnd_values",
@@ -534,7 +538,8 @@
         "options": [
           "0",
           "1"
-        ]
+        ],
+        "access": "write"
       },
       {
         "key": "feedback",

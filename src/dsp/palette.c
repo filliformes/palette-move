@@ -1521,11 +1521,11 @@ static int get_param(void *instance, const char *key, char *buf, int buf_len){
             o+=snprintf(buf+o,buf_len-o,"%s\"%d %s\"",i?",":"",i+1,PRESETS[i].name);
         o+=snprintf(buf+o,buf_len-o,"]},");
         o+=snprintf(buf+o,buf_len-o,
-          "{\"key\":\"rnd_patch\",\"name\":\"Rnd Patch\",\"type\":\"enum\",\"options\":[\"0\",\"1\"]},"
-          "{\"key\":\"rnd_effect\",\"name\":\"Rnd FX\",\"type\":\"enum\",\"options\":[\"0\",\"1\"]},"
-          "{\"key\":\"rnd_amount\",\"name\":\"Rnd Amt\",\"type\":\"enum\",\"options\":[\"0\",\"1\"]},"
-          "{\"key\":\"rnd_macro\",\"name\":\"Rnd Macro\",\"type\":\"enum\",\"options\":[\"0\",\"1\"]},"
-          "{\"key\":\"rnd_values\",\"name\":\"Rnd Values\",\"type\":\"enum\",\"options\":[\"0\",\"1\"]},");
+          "{\"key\":\"rnd_patch\",\"name\":\"Rnd Patch\",\"type\":\"enum\",\"options\":[\"0\",\"1\"],\"access\":\"write\"},"
+          "{\"key\":\"rnd_effect\",\"name\":\"Rnd FX\",\"type\":\"enum\",\"options\":[\"0\",\"1\"],\"access\":\"write\"},"
+          "{\"key\":\"rnd_amount\",\"name\":\"Rnd Amt\",\"type\":\"enum\",\"options\":[\"0\",\"1\"],\"access\":\"write\"},"
+          "{\"key\":\"rnd_macro\",\"name\":\"Rnd Macro\",\"type\":\"enum\",\"options\":[\"0\",\"1\"],\"access\":\"write\"},"
+          "{\"key\":\"rnd_values\",\"name\":\"Rnd Values\",\"type\":\"enum\",\"options\":[\"0\",\"1\"],\"access\":\"write\"},");
         /* FX Reorder — menu-only enum of all 24 chain permutations */
         o+=snprintf(buf+o,buf_len-o,"{\"key\":\"fx_reorder\",\"name\":\"FX Reorder\",\"type\":\"enum\",\"options\":[");
         for(int i=0;i<24;i++){ char lb[16]; perm_label(i,lb,sizeof lb);
