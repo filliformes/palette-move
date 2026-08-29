@@ -197,6 +197,7 @@
       },
       {
         "key": "fx1_amount",
+        "short_name": "1 AMT",
         "name": "FX1 Amount",
         "type": "float",
         "min": 0,
@@ -205,6 +206,7 @@
       },
       {
         "key": "fx1_macro",
+        "short_name": "1 MAC",
         "name": "FX1 Macro",
         "type": "float",
         "min": 0,
@@ -213,6 +215,7 @@
       },
       {
         "key": "fx1_drift",
+        "short_name": "1 DRF",
         "name": "FX1 Drift",
         "type": "float",
         "min": 0,
@@ -253,6 +256,7 @@
       },
       {
         "key": "fx2_amount",
+        "short_name": "2 AMT",
         "name": "FX2 Amount",
         "type": "float",
         "min": 0,
@@ -261,6 +265,7 @@
       },
       {
         "key": "fx2_macro",
+        "short_name": "2 MAC",
         "name": "FX2 Macro",
         "type": "float",
         "min": 0,
@@ -269,6 +274,7 @@
       },
       {
         "key": "fx2_drift",
+        "short_name": "2 DRF",
         "name": "FX2 Drift",
         "type": "float",
         "min": 0,
@@ -309,6 +315,7 @@
       },
       {
         "key": "fx3_amount",
+        "short_name": "3 AMT",
         "name": "FX3 Amount",
         "type": "float",
         "min": 0,
@@ -317,6 +324,7 @@
       },
       {
         "key": "fx3_macro",
+        "short_name": "3 MAC",
         "name": "FX3 Macro",
         "type": "float",
         "min": 0,
@@ -325,6 +333,7 @@
       },
       {
         "key": "fx3_drift",
+        "short_name": "3 DRF",
         "name": "FX3 Drift",
         "type": "float",
         "min": 0,
@@ -365,6 +374,7 @@
       },
       {
         "key": "fx4_amount",
+        "short_name": "4 AMT",
         "name": "FX4 Amount",
         "type": "float",
         "min": 0,
@@ -373,6 +383,7 @@
       },
       {
         "key": "fx4_macro",
+        "short_name": "4 MAC",
         "name": "FX4 Macro",
         "type": "float",
         "min": 0,
@@ -381,6 +392,7 @@
       },
       {
         "key": "fx4_drift",
+        "short_name": "4 DRF",
         "name": "FX4 Drift",
         "type": "float",
         "min": 0,
@@ -389,6 +401,7 @@
       },
       {
         "key": "input_vol",
+        "short_name": "IN",
         "name": "Input Vol",
         "type": "float",
         "min": 0,
@@ -462,6 +475,7 @@
       },
       {
         "key": "fx_reorder",
+        "short_name": "Reorder",
         "name": "FX Reorder",
         "type": "enum",
         "options": [
@@ -493,6 +507,7 @@
       },
       {
         "key": "rnd_patch",
+        "short_name": "RNDPAT",
         "name": "Rnd Patch",
         "type": "enum",
         "options": [
@@ -502,6 +517,7 @@
       },
       {
         "key": "rnd_effect",
+        "short_name": "RND X",
         "name": "Rnd FX",
         "type": "enum",
         "options": [
@@ -511,6 +527,7 @@
       },
       {
         "key": "rnd_amount",
+        "short_name": "Amt",
         "name": "Rnd Amt",
         "type": "enum",
         "options": [
@@ -520,6 +537,7 @@
       },
       {
         "key": "rnd_macro",
+        "short_name": "RNDMAC",
         "name": "Rnd Macro",
         "type": "enum",
         "options": [
@@ -529,6 +547,7 @@
       },
       {
         "key": "rnd_values",
+        "short_name": "RNDVAL",
         "name": "Rnd Values",
         "type": "enum",
         "options": [
@@ -546,6 +565,7 @@
       },
       {
         "key": "tempo_src",
+        "short_name": "Src",
         "name": "Tempo Src",
         "type": "enum",
         "options": [
@@ -563,6 +583,7 @@
       },
       {
         "key": "time_div",
+        "short_name": "Div",
         "name": "Time Div",
         "type": "enum",
         "options": [
