@@ -51,6 +51,6 @@ ssh ableton@move.local 'rm -rf /data/UserData/schwung/modules/audio_fx/palette'
 
 ---
 
-This is a **v0.1.0 test build** shared for feedback — see [MANUAL.md](MANUAL.md) for the full
+This is a **v0.1.5 test build** shared for feedback — see [MANUAL.md](MANUAL.md) for the full
 guide and the "what I'm looking for feedback on" section. Bugs/ideas → open an issue or ping on
 Discord.

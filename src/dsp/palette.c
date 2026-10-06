@@ -153,17 +153,24 @@ typedef struct {
     /* tempo sync (set per block by the host): >0 = use instead of Macro mapping */
     float  sync_time;         /* synced delay time in samples (0 = free) */
     float  sync_rate;         /* synced LFO rate in Hz (0 = free) */
+    float  lvlDry, lvlWet, lvlGain;   /* Character-group level match (see process_block) */
+    float  lvlW;                      /* how much of it applies (fades with Amount) */
     /* heavy C++ (Clouds) effect state — lazily alloc'd on select change */
     void  *heavy;
     int    heavy_kind;        /* PFX_* id the heavy ptr currently serves (0 = none) */
 } slot_dsp_t;
 
 typedef struct {
-    int   select;             /* PFX_* id (0 = Off) */
+    int   select;             /* PFX_* id (0 = Off) — the TARGET (UI, uniqueness, state) */
+    int   active;             /* PFX_* id actually running in the DSP. Lags `select`: on a
+                               * change the running effect first fades out to dry, then
+                               * the slot swaps (slot_engage) and the new one fades in. */
     int   prev_select;        /* for Skip-walk direction inference */
     float amount, macro, drift;       /* knob targets */
-    float amt_sm, mac_sm, drf_sm;     /* 20 ms analog-style smoothed values (fed to DSP) */
+    float amt_sm, mac_sm, drf_sm;     /* 15 ms analog-style smoothed values (fed to DSP) */
     float ramp;               /* 0..1 click-free fade-in after an effect switch */
+    float xgain;              /* 0..1 fade-out of the running effect before a switch */
+    float gate, genv;         /* Character noise gate: gain + dry peak envelope */
     slot_dsp_t dsp;
 } slot_t;
 
@@ -190,7 +197,9 @@ typedef struct {
     float  input_vol;         /* 0..2, unity = 1 */
     float  mix;               /* 0..1 global dry/wet */
     float  iv_sm, mix_sm;     /* 20 ms smoothed globals */
-    int    fx_reorder;        /* 0..23 permutation index (0 = 1-2-3-4) */
+    int    fx_reorder;        /* 0..23 permutation index (0 = 1-2-3-4) — target */
+    int    order_cur;         /* permutation actually running (lags fx_reorder by a dip) */
+    float  ro_gain;           /* 0..1 chain wet gain for the reorder dip */
     int    current_preset;    /* 1..50 */
     int    current_level;     /* page-aware knob overlay (see LEVELS) */
     uint32_t rng;
@@ -299,6 +308,21 @@ static inline float tape_asym(float x,float drive,float asym){ /* mello-move */
     return sb_tanh(x*drive+asym)-sb_tanh(asym);
 }
 
+/* ── First-order ADAA (antiderivative anti-aliasing) ────────────────────────────
+ * A hard-driven shaper folds its harmonics back below Nyquist as inharmonic fizz
+ * (Drive measured more alias than harmonic energy at full Amount). ADAA outputs the
+ * AVERAGE of the shaper over the segment between successive input samples,
+ * (F(u1)-F(u0))/(u1-u0) with F the antiderivative, which suppresses most of it for
+ * the cost of a half-sample delay. log(cosh) is the antiderivative of tanh; double
+ * precision because F is large where tanh is flat and the difference is small. */
+static inline double logcosh_d(double x){ double a=fabs(x); return a + log1p(exp(-2.0*a)) - 0.6931471805599453; }
+static inline float tanh_adaa(float u, float *u_prev){
+    float u0=*u_prev; *u_prev=u;
+    double du=(double)u-(double)u0;
+    if(fabs(du)<1e-3) return tanhf(0.5f*(u+u0));
+    return (float)((logcosh_d(u)-logcosh_d(u0))/du);
+}
+
 static void fx_passthrough(slot_dsp_t *s, float *l, float *r, int n,
                            float amount, float macro, float drift){
     (void)s;(void)l;(void)r;(void)n;(void)amount;(void)macro;(void)drift;
@@ -307,27 +331,37 @@ static void fx_passthrough(slot_dsp_t *s, float *l, float *r, int n,
 /* ── CHARACTER ─────────────────────────────────────────────────────────────── */
 
 /* DRIVE — tube-ish overdrive that KEEPS the low end. The bass band (<~200 Hz) is
- * split off and passed clean; only the harmonic band is driven through the
- * Airwindows Spiral shaper sin(x·|x|)/|x| (Chris Johnson, MIT — soft musical fold).
+ * split off and passed clean; only the harmonic band is driven, through an
+ * asymmetric (tube-ish, even-harmonic) tanh with ADAA, DC-blocked after.
+ * (Was the Airwindows Spiral sin(x|x|)/|x|: at the gains Amount reaches, x|x| runs
+ * to ~80 rad, so it wavefolded dozens of times per cycle - more alias than signal.)
+ * The operating point is subtracted, so silence in = silence out even with bias.
  * macro = pre-emphasis tilt (brightens INTO the shaper, never high-passes the
- * output), drift = slow bias wander. State: z1=bass one-pole. */
+ * output), drift = slow bias wander. State: z1=bass one-pole, z2/z3=DC-block x/y,
+ * sm1/sm2=ADAA history L/R, f2=per-sample drive glide. */
 static void fx_drive(slot_dsp_t *s, float *l, float *r, int n,
                      float amount, float macro, float drift){
     float drv  = 1.0f + amount*6.0f + amount*amount*30.0f;
     float tilt = (macro-0.5f)*2.0f;                  /* −1..+1 brightness tilt */
     const float aBass=0.030f;                        /* ~200 Hz low/high split */
-    float himk = 0.7f + amount*0.5f;                 /* harmonic-band makeup */
+    const float asym=0.20f;                          /* tube-ish operating point */
+    float himk = (0.7f + amount*0.5f)*0.8f;          /* harmonic-band makeup */
+    if(s->f2<=0.0f) s->f2=drv;
     for(int i=0;i<n;i++){
+        s->f2 += 0.01f*(drv - s->f2);                /* glide: no gain steps */
         float bias = drift>0.0f ? wander(&s->f1,&s->seed,0.0006f)*drift*0.10f : 0.0f;
+        float c = asym + bias*4.0f;                  /* operating point (not scaled by drive) */
+        float tc = tanhf(c);
         for(int ch=0;ch<2;ch++){
             float x=(ch?r:l)[i];
             float *lp=ch?&s->z1r:&s->z1l;
             *lp += aBass*(x-*lp)+DENORM;
             float bass=*lp, high=x-*lp;              /* clean sub + harmonic band */
-            float pre=high*(1.0f+0.6f*tilt)+bias;    /* tilt = pre-emphasis, not HPF */
-            float d=pre*drv, ad=fabsf(d);
-            float sh=(ad>1e-6f)? sinf(d*ad)/ad : d;  /* Spiral soft fold */
-            float wet=bass + sh*himk;                /* bass FULL → low end intact */
+            float pre=high*(1.0f+0.6f*tilt);         /* tilt = pre-emphasis, not HPF */
+            float sh=tanh_adaa(pre*s->f2 + c, ch?&s->sm2:&s->sm1) - tc;
+            float *dx=ch?&s->z2r:&s->z2l, *dy=ch?&s->z3r:&s->z3l;
+            float y=sh - *dx + 0.9993f*(*dy); *dx=sh; *dy=y+DENORM;   /* DC block (asym) */
+            float wet=bass + y*himk;                 /* bass FULL → low end intact */
             (ch?r:l)[i]=lerpf(x, wet, amount);       /* amount=0 → dry */
         }
     }
@@ -380,16 +414,21 @@ static void fx_fuzz(slot_dsp_t *s, float *l, float *r, int n,
     float bias=(macro-0.5f)*0.4f;                    /* starved bias → asymmetry */
     float tone=0.12f+macro*0.5f;                     /* post tone LP */
     const float aIn=0.157f;                          /* input LP ~1.2 kHz */
+    float g=28.0f*sustain;
     for(int i=0;i<n;i++){
-        float b=bias + (drift>0.0f? wander(&s->f1,&s->seed,0.002f)*drift*0.3f:0.0f);
+        /* bias drift: slow (~0.4 s) and modest. It was a ~11 ms random walk of +-0.3
+         * through x87 gain - a loud rumble on its own (-6 dBFS out of SILENCE). */
+        s->f2 += 0.004f*(bias - s->f2);              /* bias glides (~6 ms): Tone turns don't jump */
+        float b=s->f2 + (drift>0.0f? wander(&s->f1,&s->seed,0.00006f)*drift*0.12f:0.0f);
+        float tb=tanhf(g*b);                         /* operating point, subtracted */
         for(int ch=0;ch<2;ch++){
             float x=(ch?r:l)[i];
             float *ilp=ch?&s->z3r:&s->z3l;
             *ilp += aIn*(x-*ilp)+DENORM;
             float xi=*ilp + b;
-            float g=28.0f*sustain;
-            float s1=-sb_tanh(g*xi);                  /* stage 1 (inverts) */
-            float s2=-sb_tanh(g*0.5f*s1);             /* stage 2 cascade → sustain */
+            /* both stages ADAA (true tanh) — the near-square output aliased hard */
+            float s1=-(tanh_adaa(g*xi, ch?&s->sm3:&s->sm1) - tb);          /* stage 1 (inverts) */
+            float s2=-tanh_adaa(g*0.5f*s1, ch?&s->sm4:&s->sm2);            /* stage 2 → sustain */
             float *dcx=ch?&s->z4r:&s->z4l, *dcy=ch?&s->bp_r:&s->bp_l;
             float y=s2 - *dcx + 0.9995f*(*dcy);       /* DC blocker (bias offset) */
             *dcx=s2; *dcy=y;
@@ -462,23 +501,54 @@ extern const float lut_ap_poles[];       /* 17 Hilbert allpass poles (SHIFT) */
 /* FOLD — West-Coast wavefolder using the REAL Warps lut_bipolar_fold curve via
  * the ALGORITHM_FOLD interpolation. amount=fold drive, macro=offset/symmetry,
  * drift=fold-point wobble. */
+/* The fold curve as a continuous function of the LUT index (linear interpolation,
+ * clamped flat outside [1,4095] exactly as the original lookup did) and its running
+ * integral, so FOLD can use ADAA. fold_cum[] is built once in create_instance. */
+static double fold_cum[4096];
+static int    fold_cum_ok;
+static void fold_adaa_init(void){
+    if(fold_cum_ok) return;
+    double c=0.0; fold_cum[0]=0.0;
+    for(int i=1;i<4096;i++){ c+=0.5*((double)lut_bipolar_fold[i-1]+(double)lut_bipolar_fold[i]); fold_cum[i]=c; }
+    fold_cum_ok=1;
+}
+static inline float fold_at(float idx){
+    if(idx<1.0f) return lut_bipolar_fold[1];
+    if(idx>=4095.0f) return lut_bipolar_fold[4095];
+    int i=(int)idx; float f=idx-(float)i;
+    return lut_bipolar_fold[i]+(lut_bipolar_fold[i+1]-lut_bipolar_fold[i])*f;
+}
+static inline double fold_F(double idx){                 /* integral of fold_at */
+    if(idx<1.0) return fold_cum[1] + (idx-1.0)*lut_bipolar_fold[1];
+    if(idx>=4095.0) return fold_cum[4095] + (idx-4095.0)*lut_bipolar_fold[4095];
+    int i=(int)idx; double f=idx-(double)i, a=lut_bipolar_fold[i], b=lut_bipolar_fold[i+1];
+    return fold_cum[i] + a*f + 0.5*(b-a)*f*f;
+}
 static void fx_fold(slot_dsp_t *s, float *l, float *r, int n,
                     float amount, float macro, float drift){
     const float kScale=2048.0f/2.295f;               /* Warps: 2048/((2+0.25)*1.02) */
+    if(!fold_cum_ok) fold_adaa_init();
     float drive=0.5f+amount*amount*4.0f;
     float off=(macro-0.5f)*1.6f;
     float comp=0.55f/(0.6f+0.4f*drive);              /* level compensation — folding is loud */
     for(int i=0;i<n;i++){
         float w=(drift>0.0f? wander(&s->f1,&s->seed,0.0009f)*drift*0.25f:0.0f);
+        float idx_op=(off+w)*kScale + 2048.0f;         /* operating point (no signal) */
+        float y_op=fold_at(idx_op);                    /* subtracted: no DC, silence = silence */
         for(int ch=0;ch<2;ch++){
             float dry=(ch?r:l)[i];
-            float x=dry*drive + off + w;
-            float idx=x*kScale + 2048.0f;             /* index into lut_bipolar_fold */
-            int i0=(int)idx; if(i0<1)i0=1; else if(i0>4094)i0=4094;
-            float fr=idx-(float)i0; if(fr<0.0f)fr=0.0f; else if(fr>1.0f)fr=1.0f;
-            float y=lut_bipolar_fold[i0]+(lut_bipolar_fold[i0+1]-lut_bipolar_fold[i0])*fr;
+            float idx=(dry*drive + off + w)*kScale + 2048.0f;   /* index into lut_bipolar_fold */
+            float *ip=ch?&s->sm2:&s->sm1;              /* ADAA: average over the segment */
+            if(*ip==0.0f) *ip=idx;
+            double di=(double)idx-(double)*ip;
+            float y=(fabs(di)<0.01)? fold_at(0.5f*(idx+*ip))
+                                   : (float)((fold_F(idx)-fold_F(*ip))/di);
+            *ip=idx;
+            y-=y_op;
+            float *dx=ch?&s->z2r:&s->z2l, *dy=ch?&s->z3r:&s->z3l;
+            float yb=y - *dx + 0.9993f*(*dy); *dx=y; *dy=yb+DENORM;   /* DC block: offset folds */
             float *z=ch?&s->z1r:&s->z1l;
-            *z += 0.5f*(y*comp-*z)+DENORM;             /* mild LP smooth, level-matched */
+            *z += 0.5f*(yb*comp-*z)+DENORM;            /* mild LP smooth, level-matched */
             (ch?r:l)[i]=lerpf(dry,*z,amount);          /* amount=0 → dry */
         }
     }
@@ -490,9 +560,12 @@ static void fx_fold(slot_dsp_t *s, float *l, float *r, int n,
  * drift=random momentary detune. */
 static void fx_doubler(slot_dsp_t *s, float *l, float *r, int n,
                        float amount, float macro, float drift){
-    float baseL=(s->sync_time>0.0f)? s->sync_time : SR*(0.012f+macro*0.045f); /* 12..57ms / synced */
-    float baseR=baseL*1.28f;
+    float tgtL=(s->sync_time>0.0f)? s->sync_time : SR*(0.012f+macro*0.045f); /* 12..57ms / synced */
+    if(tgtL>(float)(MAX_DELAY/2)) tgtL=(float)(MAX_DELAY/2);
+    if(s->f2<1.0f) s->f2=tgtL;                        /* f2 = gliding delay time */
     for(int i=0;i<n;i++){
+        s->f2 += clampf(0.001f*(tgtL-s->f2), -0.25f, 0.25f);   /* Time glides: no read-head jumps */
+        float baseL=s->f2, baseR=baseL*1.28f;
         s->lfo+=0.6f/SR; if(s->lfo>=1.0f)s->lfo-=1.0f;
         s->lfo2+=0.43f/SR; if(s->lfo2>=1.0f)s->lfo2-=1.0f;
         float wob=(drift>0.0f? wander(&s->f1,&s->seed,0.004f)*drift:0.0f);
@@ -513,11 +586,14 @@ static void fx_doubler(slot_dsp_t *s, float *l, float *r, int n,
 static void fx_vibrato(slot_dsp_t *s, float *l, float *r, int n,
                        float amount, float macro, float drift){
     float rate=(s->sync_rate>0.0f)? s->sync_rate : 0.5f+macro*7.5f;  /* 0.5..8 Hz / synced */
-    float depth=SR*0.0005f*(0.3f+amount*4.0f);       /* mod depth in samples */
+    float dtarget=SR*0.0005f*(0.3f+amount*4.0f);     /* mod depth in samples */
     float base=SR*0.006f;
     float fmRate=rate*1.61f;                          /* incommensurate 2nd LFO */
     float fmDepth=0.2f+drift*0.35f;                   /* through-zero FM amount (tamed) */
+    if(s->f2<=0.0f) s->f2=dtarget;
     for(int i=0;i<n;i++){
+        s->f2 += 0.003f*(dtarget - s->f2);           /* depth glides: no read-head jumps */
+        float depth=s->f2;
         s->lfo2+=fmRate/SR; if(s->lfo2>=1.0f)s->lfo2-=1.0f;
         s->lfo+=(rate*(1.0f+fmDepth*0.5f*sinf(s->lfo2*TWO_PI)))/SR;  /* through-zero FM */
         if(s->lfo>=1.0f)s->lfo-=1.0f; if(s->lfo<0.0f)s->lfo+=1.0f;
@@ -544,7 +620,11 @@ static void fx_vibrato(slot_dsp_t *s, float *l, float *r, int n,
  * drift=sweep randomness. */
 static void fx_phaser(slot_dsp_t *s, float *l, float *r, int n,
                       float amount, float macro, float drift){
-    int stages=2+(int)(amount*10.0f); if(stages>12)stages=12;  /* 2..12 */
+    /* 2..12 stages, CONTINUOUS: all 12 allpasses always run (their state stays live)
+     * and the output blends between stage n and n+1. An integer stage count jumped
+     * the phase response at every step of Amount - a click per step. */
+    float stf=2.0f+amount*10.0f; int n0=(int)stf; if(n0>12)n0=12;
+    float sfr=(n0<12)? stf-(float)n0 : 0.0f;
     float rate=(s->sync_rate>0.0f)? s->sync_rate : 0.05f+macro*macro*4.0f;  /* synced */
     float fb=amount*0.6f;
     for(int i=0;i<n;i++){
@@ -558,11 +638,13 @@ static void fx_phaser(slot_dsp_t *s, float *l, float *r, int n,
             float g=tanf(3.14159265f*clampf(fc,30.0f,12000.0f)/SR);
             float coef=(g-1.0f)/(g+1.0f);                       /* allpass coefficient */
             float *ap=ch?s->ap_r:s->ap_l; float *fbz=ch?&s->z2r:&s->z2l;
-            float x=(ch?r:l)[i]+ *fbz*fb;
-            for(int k=0;k<stages;k++){
+            float x=(ch?r:l)[i]+ *fbz*fb, xa=x, xb=x;
+            for(int k=0;k<12;k++){
                 float y=coef*x+ap[k];                 /* 1st-order allpass */
-                ap[k]=x-coef*y; x=y;
+                ap[k]=x-coef*y+DENORM; x=y;
+                if(k==n0-1) xa=x; else if(k==n0) xb=x;
             }
+            x=xa+(xb-xa)*sfr;
             *fbz=x;
             (ch?r:l)[i]=lerpf((ch?r:l)[i],0.5f*((ch?r:l)[i]+x),amount); /* amount=0 → dry */
         }
@@ -610,7 +692,9 @@ static void fx_pitch(slot_dsp_t *s, float *l, float *r, int n,
                      float amount, float macro, float drift){
     float ratio=powf(2.0f,(macro-0.5f)*2.0f);        /* 0.5 .. 2.0 */
     float win=SR*0.040f;                              /* 40 ms window */
-    float drate=(1.0f-ratio);                         /* read-ptr drift / sample */
+    /* read delay = win - f1, so the read head moves 1 + (ratio-1) = ratio samples per
+     * sample. (Was 1-ratio: speed 2-ratio, i.e. inverted, and FROZEN at Macro 1.) */
+    float drate=(ratio-1.0f);                         /* read-ptr drift / sample */
     /* drift = gentle resolution drop: 9 bits (subtle) → 4 bits (gritty), blended in */
     float q=(drift>0.0f)? powf(2.0f, 9.0f-drift*5.0f) : 0.0f;
     for(int i=0;i<n;i++){
@@ -676,7 +760,9 @@ static void delay_core(slot_dsp_t *s, float *l, float *r, int n,
     float fb=amount*fb_cap;
     float wet=clampf(amount*1.4f,0.0f,1.0f);          /* amount=0 → dry */
     for(int i=0;i<n;i++){
-        s->f6 += 0.0004f*(t-s->f6);                   /* glide delay time (no zipper/click) */
+        /* glide delay time, slew-limited to +-0.5 samples/sample (pitch 0.5x..1.5x while
+         * it moves, like a tape machine) - unlimited, a fast Time turn read at -8x */
+        s->f6 += clampf(0.0004f*(t-s->f6), -0.5f, 0.5f);
         s->lfo+=wow_hz/SR;  if(s->lfo>=1.0f)s->lfo-=1.0f;     /* wow */
         s->lfo2+=6.3f/SR;   if(s->lfo2>=1.0f)s->lfo2-=1.0f;   /* flutter */
         float wob=wow_depth*sinf(s->lfo*TWO_PI)
@@ -689,11 +775,23 @@ static void delay_core(slot_dsp_t *s, float *l, float *r, int n,
         s->z1r+=lp_amt*(tapR-s->z1r)+DENORM; s->z2r+=lp_amt*(s->z1r-s->z2r)+DENORM;
         float fl=delay_saturate(s->z2l*fb, sat_drive, 0.02f);
         float fr=delay_saturate(s->z2r*fb, sat_drive, 0.02f);
-        if(hiss>0.0f){ float sig=fabsf(tapL)+fabsf(tapR);   /* gated tape hiss */
-            if(sig>0.001f){ fl+=hiss*(frand(&s->seed)-0.5f); fr+=hiss*(frand(&s->seed)-0.5f); } }
+        /* hiss stays OUT of the feedback path: at REELS's >unity feedback it accumulated
+         * into loud noise, and held its own gate open (ported from Loopex). */
         s->dl_l[s->wp]=l[i]+fl; s->dl_r[s->wp]=r[i]+fr;
         s->wp=(s->wp+1)%MAX_DELAY;
-        l[i]+=tapL*0.9f*wet; r[i]+=tapR*0.9f*wet;
+        float hsL=0.0f,hsR=0.0f;
+        if(hiss>0.0f){
+            /* tape hiss on the wet output only, riding a smoothed echo envelope (2 ms up,
+             * ~150 ms down) and low-passed ~6 kHz. It used to be switched per SAMPLE on
+             * the instantaneous tap level, so it chattered on/off at every zero crossing. */
+            float mag=0.5f*(fabsf(tapL)+fabsf(tapR));
+            s->env += (mag>s->env? 0.01f : 0.00015f)*(mag-s->env) + DENORM;
+            float hg=hiss*clampf(s->env*30.0f,0.0f,1.0f);
+            s->z3l += 0.575f*(hg*(frand(&s->seed)-0.5f)-s->z3l) + DENORM;
+            s->z3r += 0.575f*(hg*(frand(&s->seed)-0.5f)-s->z3r) + DENORM;
+            hsL=s->z3l; hsR=s->z3r;
+        }
+        l[i]+=(tapL*0.9f+hsL)*wet; r[i]+=(tapR*0.9f+hsR)*wet;
     }
 }
 /* CASCADE — BBD bucket-brigade: brighter-but-bandlimited repeats, fast subtle
@@ -706,47 +804,85 @@ static void fx_cascade(slot_dsp_t *s, float *l, float *r, int n,
  * tape saturation, gated hiss, higher feedback cap (self-oscillates). */
 static void fx_reels(slot_dsp_t *s, float *l, float *r, int n,
                      float amount, float macro, float drift){
-    delay_core(s,l,r,n,amount,macro,drift,1.05f,0.42f,0.7f,0.0016f,1.9f,0.0006f,0.0022f);
+    delay_core(s,l,r,n,amount,macro,drift,1.05f,0.42f,0.7f,0.0016f,1.9f,0.0006f,0.0006f);
 }
 
 /* REVERSE — reverse delay. amount=wet mix, macro=segment time, drift=pitch mod.
- * Records forward; plays windowed segments backward. */
+ * Records forward; two read heads play the recent past BACKWARD (delay grows by 2
+ * samples per sample = reverse at 1x), half a segment apart, each under a sin^2
+ * window, so the windows sum to 1 and the reversed stream is continuous. Each head
+ * latches the segment length when it wraps, so turning Time never jumps a head.
+ * (Was one head whose delay SHRANK by 1/sample: forward at 2x, not reverse.)
+ * State: f2=phase, f3/f4=latched segment A/B, f6=smoothed segment. */
 static void fx_reverse(slot_dsp_t *s, float *l, float *r, int n,
                        float amount, float macro, float drift){
     float seg=(s->sync_time>0.0f)? s->sync_time : SR*(0.08f+macro*0.6f); /* 80..680ms / synced */
+    if(seg>(float)(MAX_DELAY/2-8)) seg=(float)(MAX_DELAY/2-8);
     float spd=1.0f+(drift>0.0f? wander(&s->f1,&s->seed,0.0008f)*drift*0.05f:0.0f);
+    if(s->f6<1.0f){ s->f6=seg; s->f3=seg; s->f4=seg; s->f2=0.0f; }
     for(int i=0;i<n;i++){
+        s->f6 += 0.0005f*(seg-s->f6);
         s->dl_l[s->wp]=l[i]; s->dl_r[s->wp]=r[i];
-        s->f2-=spd; if(s->f2<=0.0f) s->f2+=seg;       /* reverse read offset grows */
-        float d=s->f2;                                 /* read this far behind */
-        float env=0.5f-0.5f*cosf(TWO_PI*(seg-s->f2)/seg);  /* window the segment */
-        float oL=dlr(s->dl_l,s->wp,d)*env, oR=dlr(s->dl_r,s->wp,d)*env;
+        float ph=s->f2, phb=ph+0.5f; if(phb>=1.0f) phb-=1.0f;
+        float sa=sinf(3.14159265f*ph),  wa=sa*sa;
+        float sb=sinf(3.14159265f*phb), wb=sb*sb;
+        float da=2.0f+2.0f*s->f3*ph, db=2.0f+2.0f*s->f4*phb;
+        float oL=dlr(s->dl_l,s->wp,da)*wa + dlr(s->dl_l,s->wp,db)*wb;
+        float oR=dlr(s->dl_r,s->wp,da)*wa + dlr(s->dl_r,s->wp,db)*wb;
         s->wp=(s->wp+1)%MAX_DELAY;
+        float nph=ph+spd/s->f6;
+        if(ph<0.5f && nph>=0.5f) s->f4=s->f6;          /* head B wraps (its window is 0) */
+        if(nph>=1.0f){ nph-=1.0f; s->f3=s->f6; }       /* head A wraps */
+        s->f2=nph;
         l[i]=lerpf(l[i],oL,amount); r[i]=lerpf(r[i],oR,amount);
     }
 }
 
 /* COLLAGE — glitch/granular looping delay. amount=feedback, macro=loop time,
- * drift=random double-speed/reverse grains. */
+ * drift=random double-speed/reverse grains.
+ * A grain is a read head at delay f3 inside the loop; the delay moves by (1-speed)
+ * per sample, so speed 1 = steady repeat, 2 = octave up, -1 = reverse. (It used to
+ * move by -speed: every grain played at 2x and "reverse" grains froze on one sample.)
+ * Every grain change - new grain or a wrap inside the loop - hands the old head a
+ * ~7 ms fade-out while the new one fades in, instead of jumping. Feedback is
+ * soft-clipped. State: f3/f4=head delay/speed, f1/f2=fading head, i1=samples left
+ * in grain, i2=crossfade left, f5=smoothed loop length. */
+#define COL_XF 300
 static void fx_collage(slot_dsp_t *s, float *l, float *r, int n,
                        float amount, float macro, float drift){
     float loop=(s->sync_time>0.0f)? s->sync_time : SR*(0.05f+macro*1.2f);
+    if(loop>(float)(MAX_DELAY-COL_XF*4)) loop=(float)(MAX_DELAY-COL_XF*4);
     if(s->f5<1.0f || s->f5>SR*1.3f) s->f5=loop;       /* init/repair smoothed loop time */
     float fb=amount*0.9f;
     for(int i=0;i<n;i++){
-        s->f5 += 0.0004f*(loop-s->f5);                /* glide loop time (no distortion on knob turn) */
+        s->f5 += clampf(0.0004f*(loop-s->f5), -0.5f, 0.5f);   /* glide loop time, slew-limited */
         float lps=s->f5;
-        /* grain scheduler: f3=grain pos, f4=grain speed, i1=samples left */
-        if(s->i1<=0){
-            s->i1=(int)(SR*(0.04f+frand(&s->seed)*0.12f));
-            s->f4=1.0f;
-            if(drift>0.0f && frand(&s->seed)<drift*0.5f) s->f4=(frand(&s->seed)<0.5f?2.0f:-1.0f);
-            s->f3=frand(&s->seed)*lps;
+        /* one crossfade at a time: starting another mid-fade would drop the fading head */
+        if(s->i2<=0 && (s->i1<=0 || s->f3<1.0f || s->f3>lps)){
+            s->f1=s->f3; s->f2=s->f4; s->i2=(s->f4!=0.0f)? COL_XF : 0;   /* old head fades
+                                                         (f4==0 only before the first grain) */
+            if(s->i1<=0){                              /* new grain */
+                s->i1=(int)(SR*(0.04f+frand(&s->seed)*0.12f));
+                s->f4=1.0f;
+                if(drift>0.0f && frand(&s->seed)<drift*0.5f) s->f4=(frand(&s->seed)<0.5f?2.0f:-1.0f);
+                s->f3=1.0f+frand(&s->seed)*(lps-2.0f);
+            } else {                                   /* wrapped inside the loop */
+                s->f3 += (s->f3<1.0f)? lps-1.0f : -(lps-1.0f);
+                s->f3=clampf(s->f3,1.0f,lps);
+            }
         }
         s->i1--;
-        s->f3+=s->f4; if(s->f3<0)s->f3+=lps; if(s->f3>=lps)s->f3-=lps;
-        float gL=dlr(s->dl_l,s->wp,lps-s->f3), gR=dlr(s->dl_r,s->wp,lps-s->f3);
-        s->dl_l[s->wp]=l[i]+gL*fb; s->dl_r[s->wp]=r[i]+gR*fb;
+        float hd=s->f3<1.0f? 1.0f : s->f3;            /* past the edge while a fade finishes */
+        float gL=dlr(s->dl_l,s->wp,hd), gR=dlr(s->dl_r,s->wp,hd);
+        s->f3 += 1.0f - s->f4;
+        if(s->i2>0){                                   /* crossfade from the old head */
+            float w=(float)s->i2/(float)COL_XF;
+            float od=s->f1<1.0f? 1.0f : s->f1;
+            gL=gL*(1.0f-w)+dlr(s->dl_l,s->wp,od)*w;
+            gR=gR*(1.0f-w)+dlr(s->dl_r,s->wp,od)*w;
+            s->f1 += 1.0f - s->f2; s->i2--;
+        }
+        s->dl_l[s->wp]=sb_tanh(l[i]+gL*fb); s->dl_r[s->wp]=sb_tanh(r[i]+gR*fb);
         s->wp=(s->wp+1)%MAX_DELAY;
         l[i]=lerpf(l[i],gL,amount*0.9f); r[i]=lerpf(r[i],gR,amount*0.9f);
     }
@@ -754,32 +890,44 @@ static void fx_collage(slot_dsp_t *s, float *l, float *r, int n,
 
 /* ── TEXTURE ───────────────────────────────────────────────────────────────── */
 
-/* FILTER — multimode Tilt/LP/HP (SVF) with resonance. amount=cutoff,
- * macro=mode (0 LP · 0.5 tilt · 1 HP), drift=cutoff wander. */
-/* FILTER — single-knob DJ filter on a resonant Cytomic/TPT SVF (stable). amount
+/* FILTER — single-knob DJ filter on resonant Cytomic/TPT SVFs (stable). amount
  * sweeps LP→through→HP (center = open/neutral, like a DJ isolator); macro = resonance;
- * drift = cutoff wander. State per ch: lp_*=ic1eq, bp_*=ic2eq. */
+ * drift = cutoff wander. A dedicated LP and a dedicated HP filter both run all the
+ * time (each parked wide open on the other side), and the output blends to each one
+ * continuously around the center. A single SVF switching between its LP and HP taps
+ * at the center jumped in phase there - the loudest click in the audit.
+ * State per ch: LP = lp_x and bp_x (ic1, ic2), HP = z1x and z2x; f1 = wander. */
+static inline float svf_tpt(float x, float *ic1, float *ic2, float a1, float a2, float a3, float k, int hp){
+    float v3=x-*ic2, v1=a1*(*ic1)+a2*v3, v2=*ic2+a2*(*ic1)+a3*v3;
+    *ic1=2.0f*v1-*ic1+DENORM; *ic2=2.0f*v2-*ic2+DENORM;
+    return hp? (x-k*v1-v2) : v2;
+}
 static void fx_filter(slot_dsp_t *s, float *l, float *r, int n,
                       float amount, float macro, float drift){
     float amt=clampf(amount,0.0f,1.0f);
-    int hp; float fc;
-    if(amt<0.5f){ hp=0; fc=200.0f*powf(90.0f, amt*2.0f); }        /* LP 200 Hz .. 18 kHz */
-    else        { hp=1; fc=20.0f *powf(20.0f,(amt-0.5f)*2.0f); }  /* HP 20 Hz .. 400 Hz */
-    if(drift>0.0f) fc*=1.0f+wander(&s->f1,&s->seed,0.0007f)*drift*0.3f;
-    fc=clampf(fc,20.0f,18000.0f);
-    float wetx=clampf(fabsf(amt-0.5f)/0.05f,0.0f,1.0f);           /* dry exactly at center */
-    float g=tanf(3.14159265f*fc/SR);
-    float k=1.0f-clampf(macro,0.0f,1.0f)*0.9f;                    /* resonance (1/Q) */
-    float a1=1.0f/(1.0f+g*(g+k)), a2=g*a1, a3=g*a2;
+    float wf=(drift>0.0f)? 1.0f+wander(&s->f1,&s->seed,0.0007f)*drift*0.3f : 1.0f;
+    float fl=(amt<0.5f)? 200.0f*powf(90.0f, amt*2.0f) : 18000.0f;          /* LP 200 Hz .. 18 kHz */
+    float fh=(amt>0.5f)? 20.0f*powf(20.0f,(amt-0.5f)*2.0f) : 20.0f;        /* HP 20 Hz .. 400 Hz */
+    fl=clampf(fl*wf,20.0f,18000.0f); fh=clampf(fh*wf,15.0f,18000.0f);
+    float wl=clampf((0.5f-amt)/0.05f,0.0f,1.0f);                          /* dry exactly at center */
+    float wh=clampf((amt-0.5f)/0.05f,0.0f,1.0f);
+    if(s->f4==0.0f){ s->f2=wl; s->f3=wh; s->f4=1.0f; }                     /* f2/f3 = last weights */
+    float wl0=s->f2, wh0=s->f3, dwl=(wl-wl0)/(float)n, dwh=(wh-wh0)/(float)n;
+    s->f2=wl; s->f3=wh;
+    float k=1.0f-clampf(macro,0.0f,1.0f)*0.9f;                            /* resonance (1/Q) */
+    float gl=tanf(3.14159265f*fl/SR), gh=tanf(3.14159265f*fh/SR);
+    float l1=1.0f/(1.0f+gl*(gl+k)), l2=gl*l1, l3=gl*l2;
+    float h1=1.0f/(1.0f+gh*(gh+k)), h2=gh*h1, h3=gh*h2;
     for(int ch=0;ch<2;ch++){
-        float *ic1=ch?&s->lp_r:&s->lp_l, *ic2=ch?&s->bp_r:&s->bp_l;
         float *src=ch?r:l;
+        float *lc1=ch?&s->lp_r:&s->lp_l, *lc2=ch?&s->bp_r:&s->bp_l;
+        float *hc1=ch?&s->z1r:&s->z1l,   *hc2=ch?&s->z2r:&s->z2l;
         for(int i=0;i<n;i++){
             float x=src[i];
-            float v3=x-*ic2, v1=a1*(*ic1)+a2*v3, v2=*ic2+a2*(*ic1)+a3*v3;
-            *ic1=2.0f*v1-*ic1+DENORM; *ic2=2.0f*v2-*ic2+DENORM;
-            float filt=hp? (x-k*v1-v2) : v2;          /* HP or LP tap */
-            src[i]=lerpf(x,filt,wetx);
+            float lp=svf_tpt(x,lc1,lc2,l1,l2,l3,k,0);
+            float hp=svf_tpt(x,hc1,hc2,h1,h2,h3,k,1);
+            float a=(float)(i+1);
+            src[i]=x+(lp-x)*(wl0+dwl*a)+(hp-x)*(wh0+dwh*a);
         }
     }
 }
@@ -791,17 +939,20 @@ static void fx_filter(slot_dsp_t *s, float *l, float *r, int n,
 static void fx_squash(slot_dsp_t *s, float *l, float *r, int n,
                       float amount, float macro, float drift){
     if(s->f1<1.0f){ s->f1=s->f2=10000.0f; s->f3=s->f4=1.0f; } /* Pressure4 ctor inits */
-    float A=clampf(amount,0.0f,1.0f), B=0.4f;          /* B = release speed (fixed, musical) */
-    float threshold=1.0f-(A*0.95f);
-    float muMakeupGain=1.0f/threshold;
+    float At=clampf(amount,0.0f,1.0f), B=0.4f;         /* B = release speed (fixed, musical) */
+    if(s->z1l<=0.0f) s->z1l=At+1e-6f;                    /* z1l = per-sample Amount (makeup is up to 20x) */
     float release=powf(1.28f-B,5.0f)*32768.0f;          /* overallscale = 1 @ 44.1k */
     float fastest=sqrtf(release);
     float mewiness=(macro*2.0f)-1.0f, unmew;
     int positivemu; if(mewiness>=0){positivemu=1;unmew=1.0f-mewiness;}
                     else{positivemu=0;mewiness=-mewiness;unmew=1.0f-mewiness;}
     float outGain=1.0f;
-    float comp=0.5f+0.5f*threshold;                      /* gain-comp: cancels the 1/threshold makeup */
     for(int i=0;i<n;i++){
+        s->z1l += 0.01f*(At+1e-6f - s->z1l);
+        float A=s->z1l;
+        float threshold=1.0f-(A*0.95f);
+        float muMakeupGain=1.0f/threshold;
+        float comp=0.5f+0.5f*threshold;                  /* gain-comp: cancels the 1/threshold makeup */
         float th=threshold*(drift>0.0f?(1.0f+wander(&s->f5,&s->seed,0.004f)*drift*0.2f):1.0f);
         float xl=l[i]*muMakeupGain, xr=r[i]*muMakeupGain;
         float sense=fabsf(xl); if(fabsf(xr)>sense) sense=fabsf(xr);
@@ -839,7 +990,7 @@ static void fx_cassette(slot_dsp_t *s, float *l, float *r, int n,
     float wow_depth =(0.4f+amount*1.2f)*(1.0f+drift*1.2f); /* samples of wow */
     float flut_depth=(0.3f+amount*0.9f)*(1.0f+drift*1.6f); /* samples of flutter */
     float roll=0.06f+(1.0f-macro)*0.5f;              /* tone: darker at low macro */
-    float hiss=amount*0.0010f;                        /* much less than before */
+    float hiss=amount*0.0005f;                        /* tape hiss (see below) */
     float base=SR*0.006f;
     float sat_d=1.0f+amount*0.7f, asym=0.10f*amount;
     float comp_amt=amount*0.6f;                       /* tape compression depth */
@@ -862,8 +1013,12 @@ static void fx_cassette(slot_dsp_t *s, float *l, float *r, int n,
         xL=tape_asym(tape_cubic(xL,sat_d),1.0f,asym);
         xR=tape_asym(tape_cubic(xR,sat_d),1.0f,asym);
         s->z1l+=roll*(xL-s->z1l)+DENORM; s->z1r+=roll*(xR-s->z1r)+DENORM;
-        float nz=(mono>0.0008f)? hiss*((frand(&s->seed)-0.5f)*2.0f):0.0f;  /* gated */
-        l[i]=lerpf(l[i],s->z1l+nz,amount); r[i]=lerpf(r[i],s->z1r+nz,amount);
+        /* hiss rides the smoothed level (env), low-passed ~6 kHz. It was switched per
+         * sample on the instantaneous level, so it chattered at every zero crossing. */
+        float hg=hiss*clampf(s->env*30.0f,0.0f,1.0f);
+        s->z2l += 0.575f*(hg*((frand(&s->seed)-0.5f)*2.0f)-s->z2l) + DENORM;
+        s->z2r += 0.575f*(hg*((frand(&s->seed)-0.5f)*2.0f)-s->z2r) + DENORM;
+        l[i]=lerpf(l[i],s->z1l+s->z2l,amount); r[i]=lerpf(r[i],s->z1r+s->z2r,amount);
     }
 }
 
@@ -873,20 +1028,27 @@ static void fx_broken(slot_dsp_t *s, float *l, float *r, int n,
                       float amount, float macro, float drift){
     float rate=0.1f+macro*macro*3.0f;                /* motor failure LFO Hz */
     for(int i=0;i<n;i++){
+        /* Amount and Drift scale the READ DELAY: glide them per sample, or a knob jump
+         * moves the read head tens of samples at once */
+        s->f5 += 0.002f*(amount-s->f5); s->f6 += 0.002f*(drift-s->f6);
+        float amt=s->f5, drf=s->f6;
         s->lfo+=rate/SR; if(s->lfo>=1.0f)s->lfo-=1.0f;
+        s->lfo2+=rate*1.7f/SR; if(s->lfo2>=1.0f)s->lfo2-=1.0f;   /* own phase: x1.7 of a
+                                     * wrapping phase jumped the read head ~60 samples */
         /* periodic motor stall: read offset is ~0 at rest (so wet≈dry, NO doubling)
          * and grows during the dip (pitch drops, then recovers each cycle). */
-        float dip=amount*(0.5f-0.5f*cosf(s->lfo*TWO_PI));
+        float dip=amt*(0.5f-0.5f*cosf(s->lfo*TWO_PI));
         s->dl_l[s->wp]=l[i]; s->dl_r[s->wp]=r[i];
         float rd=3.0f + dip*SR*0.03f                  /* baseline ~0 + up to ~30 ms drop */
-               + (drift>0.0f? (0.5f+0.5f*sinf(s->lfo*TWO_PI*1.7f))*drift*SR*0.003f : 0.0f);
+               + (drf>0.0f? (0.5f+0.5f*sinf(s->lfo2*TWO_PI))*drf*SR*0.003f : 0.0f);
         float xL=dlr(s->dl_l,s->wp,rd), xR=dlr(s->dl_r,s->wp,rd);
         s->wp=(s->wp+1)%MAX_DELAY;
         /* DRIFT = occasional SMOOTHED dropouts (gate ramps → no clicks) + the warble above */
         if(drift>0.0f && frand(&s->seed)<drift*0.0004f) s->i1=(int)(SR*0.05f*frand(&s->seed));
         float gtarget=1.0f; if(s->i1>0){ s->i1--; gtarget=0.0f; }
-        s->f3 += 0.012f*(gtarget - s->f3) + DENORM;   /* ~3 ms gate ramp */
-        float am=1.0f-amount*0.3f*(0.5f-0.5f*cosf(s->lfo*TWO_PI*2.0f));   /* AM wobble */
+        s->f4 += 0.008f*(gtarget - s->f4) + DENORM;   /* two-pole ~5 ms gate: a one-pole */
+        s->f3 += 0.008f*(s->f4    - s->f3) + DENORM;   /* starts with a corner (a tick)   */
+        float am=1.0f-amt*0.3f*(0.5f-0.5f*cosf(s->lfo*TWO_PI*2.0f));      /* AM wobble */
         l[i]=lerpf(l[i],xL*s->f3*am,amount); r[i]=lerpf(r[i],xR*s->f3*am,amount);
     }
 }
@@ -902,10 +1064,10 @@ static void fx_interference(slot_dsp_t *s, float *l, float *r, int n,
     /* crush scales WITH amount (was inverted → heavy crush + noise at low amounts).
      * targetA = sample-rate increment: ~1 (clean) at A=0 → 0.03 (heavy SR reduction) at A=1.
      * targetB = bit-quant step: 0 (no quantize) at A=0 → coarse at A=1. */
-    float targetA=1.0f - A*0.97f; if(targetA<0.03f)targetA=0.03f;
+    float targetA=1.0f - A*0.92f; if(targetA<0.08f)targetA=0.08f;   /* tamed (Loopex) */
     float soften=(1.0f+targetA)/2.0f;
-    float targetB=A*A*0.33f;                          /* bit-depth derez (scales up with amount) */
-    float hard=0.45f;                                 /* more dry blend = less harsh */
+    float targetB=A*A*0.22f;                          /* bit-depth derez (scales up with amount) */
+    float hard=0.6f;                                  /* more dry blend = less harsh */
     float carr=200.0f+macro*macro*3000.0f;
     const float L256=logf(256.0f);
     for(int i=0;i<n;i++){
@@ -913,6 +1075,7 @@ static void fx_interference(slot_dsp_t *s, float *l, float *r, int n,
         s->f3=((s->f3*999.0f)+targetB)/1000.0f;        /* incrementB (bits) */
         s->f1+=s->f2;                                  /* position */
         float in[2]={l[i],r[i]};
+        { float m=0.5f*(fabsf(in[0])+fabsf(in[1])); s->env+=(m>s->env?0.01f:0.00008f)*(m-s->env)+DENORM; }
         float out[2]={s->z2l,s->z2r};                  /* outputSample = heldSample */
         if(s->f1>1.0f){
             s->f1-=1.0f;
@@ -935,19 +1098,19 @@ static void fx_interference(slot_dsp_t *s, float *l, float *r, int n,
             if(x>0.0f) x= logf(1.0f+255.0f*fabsf(x))/L256;
             else if(x<0.0f) x=-logf(1.0f+255.0f*fabsf(x))/L256;
             x=temp*hard + x*(1.0f-hard);
-            if(s->f3>0.0005f){                          /* bit-depth quantize (O(1)) */
-                if(x>0.0f)      x=ceilf (x/s->f3)*s->f3;
-                else if(x<0.0f) x=floorf(x/s->f3)*s->f3;
-            }
-            x=lerpf(x, x*sinf(s->lfo*TWO_PI), macro*0.4f);  /* ring-mod radio */
-            if(drift>0.0f && frand(&s->seed)<drift*0.04f) x+=(frand(&s->seed)-0.5f)*drift;
+            if(s->f3>0.0005f)                           /* bit-depth quantize (O(1)), ROUNDED: */
+                x=floorf(x/s->f3+0.5f)*s->f3;           /* ceil-away-from-0 blew any hiss up to a full step */
+            x=lerpf(x, x*sinf(s->lfo*TWO_PI), macro*0.3f);  /* ring-mod radio */
+            /* static bursts ride the input level (fade ~0.3 s after it stops) and are
+             * ~12 dB lower: at -29 dBFS they crackled even with no signal at all */
+            if(drift>0.0f && frand(&s->seed)<drift*0.04f) x+=(frand(&s->seed)-0.5f)*drift*0.25f*clampf(s->env*8.0f,0.0f,1.0f);
             out[c]=x;
         }
         s->z3l=in[0]; s->z3r=in[1];                    /* lastDry = dry input */
         s->z4l=lastOut[0]; s->z4r=lastOut[1];
         s->lfo+=carr/SR; if(s->lfo>=1.0f)s->lfo-=1.0f;
-        l[i]=lerpf(in[0], out[0]*0.85f, amount);       /* amount=0 → dry; trim µ-law boost */
-        r[i]=lerpf(in[1], out[1]*0.85f, amount);
+        l[i]=lerpf(in[0], out[0]*0.6f, amount);        /* amount=0 → dry; trim µ-law boost */
+        r[i]=lerpf(in[1], out[1]*0.6f, amount);
     }
 }
 
@@ -963,12 +1126,15 @@ static void fx_interference(slot_dsp_t *s, float *l, float *r, int n,
 static void fx_halo(slot_dsp_t *s, float *l, float *r, int n,
                     float amount, float macro, float drift){
     static const float ratio[6]={1.0f,1.49831f,2.0f,2.51984f,2.99661f,4.0f}; /* R 5 8ve +M3 +5 +2-8ve */
-    float root=55.0f*powf(2.0f,macro*2.0f);          /* 55..220 Hz root (A1..A3) */
+    float rtarget=55.0f*powf(2.0f,macro*2.0f);       /* 55..220 Hz root (A1..A3) */
+    if(s->f2<=0.0f) s->f2=rtarget;
     float fb=0.90f+amount*0.099f;                     /* 0.90..0.999 ring time */
     float damp=0.12f+macro*0.55f;                     /* brighter as macro rises */
     float exc=amount*0.5f;                            /* excitation into the bank */
     for(int i=0;i<n;i++){
         float drf=(drift>0.0f)? wander(&s->f1,&s->seed,0.0006f)*drift*0.012f : 0.0f;
+        s->f2 += 0.0015f*(rtarget-s->f2);              /* root glides: comb taps never jump */
+        float root=s->f2;
         for(int ch=0;ch<2;ch++){
             float *buf=ch?s->dl_r:s->dl_l;
             float *lp =ch?s->halo_lp_r:s->halo_lp_l;
@@ -1056,22 +1222,42 @@ static int resolve_select(palette_t *p, int slot, int requested, int dir){
         if(v==PFX_OFF || !effect_taken(p,v,slot)) return v;
     return PFX_OFF;
 }
-/* Heavy-aware effect assignment — the single path for ALL select changes
- * (manual scroll, direct set, randomizer, preset load). Manages Clouds heavy
- * state (free on kind change, alloc on entering a Clouds effect) and arms the
- * click-free fade-in ramp. */
+/* The single path for ALL select changes (manual scroll, direct set, randomizer,
+ * preset load). Only sets the TARGET: the audio thread fades the running effect out
+ * to dry and then calls slot_engage() (see process_block), so switching never cuts
+ * the old effect off mid-waveform. Preset load / randomize run inside the duck's
+ * silence and engage at once (slots_engage_now). */
 static void slot_apply_select(palette_t *p, int slot, int landed){
     slot_t *sl=&p->slots[slot];
     if(landed == sl->select) return;
     sl->prev_select = sl->select;
     sl->select = landed;
-    /* reference the pre-allocated pool (no runtime alloc); reset it fresh when a
-     * slot newly takes it, so no reverb tail carries into the new patch. */
+}
+/* Swap the DSP over to `select`: reference the pre-allocated Clouds pool (no runtime
+ * alloc), reset it fresh so no tail carries in, clear the scratch, arm the fade-in. */
+static void slot_engage(palette_t *p, int slot){
+    slot_t *sl=&p->slots[slot];
+    int landed=sl->select;
     void *want = (landed==PFX_SPACE)?p->space_pool : (landed==PFX_BLOOM)?p->bloom_pool : NULL;
     if(want) pfx_clouds_reset(want);
     sl->dsp.heavy=want; sl->dsp.heavy_kind = want ? landed : 0;
     slot_reset(sl);                  /* clear scratch (heavy preserved) */
-    sl->ramp = 0.0f;                 /* fade in from silence to avoid clicks */
+    sl->active = landed;
+    sl->ramp  = 0.0f;                /* new effect fades in from dry */
+    sl->xgain = 1.0f;
+    sl->gate = 1.0f; sl->genv = 0.0f;
+}
+/* A Clouds pool is shared by whichever slot holds it: don't engage it while another
+ * slot is still fading the same engine out (a few ms). */
+static int heavy_busy(palette_t *p, int slot, int fx){
+    if(!is_clouds_fx(fx)) return 0;
+    for(int i=0;i<NUM_SLOTS;i++) if(i!=slot && p->slots[i].active==fx) return 1;
+    return 0;
+}
+/* Engage every pending slot immediately — only when the output is silent (duck). */
+static void slots_engage_now(palette_t *p){
+    for(int s=0;s<NUM_SLOTS;s++) if(p->slots[s].active!=p->slots[s].select) p->slots[s].active=PFX_OFF;
+    for(int s=0;s<NUM_SLOTS;s++) if(p->slots[s].active!=p->slots[s].select) slot_engage(p,s);
 }
 static void set_slot_select(palette_t *p, int slot, int requested, int dir){
     slot_apply_select(p, slot, resolve_select(p,slot,requested,dir));
@@ -1225,7 +1411,12 @@ static void load_preset(palette_t *p, int idx){
     p->mix=pr->mix/100.0f;
     p->input_vol=pr->ivol/100.0f;
     p->fx_reorder=clampi(pr->reorder,0,23);
+    p->order_cur=p->fx_reorder;          /* silent here (duck/create): no reorder dip */
     p->current_preset=idx;
+    /* runs only in silence (duck bottom / create): swap every slot now and reset its
+     * buffers fresh, even if the effect is unchanged */
+    for(int s=0;s<NUM_SLOTS;s++) p->slots[s].active=PFX_OFF;
+    for(int s=0;s<NUM_SLOTS;s++) if(p->slots[s].select!=PFX_OFF) slot_engage(p,s);
 }
 
 /* ── Lifecycle ───────────────────────────────────────────────────────────────── */
@@ -1249,10 +1440,12 @@ static void *create_instance(const char *module_dir, const char *json){
     p->time_div = 0;                            /* Free */
     p->move_bpm = 120.0f; p->clock_interval_sm = (60.0f*SR)/(120.0f*24.0f);
     p->fx_reorder = 0;                          /* 1-2-3-4 */
+    p->order_cur = 0; p->ro_gain = 1.0f;
     p->current_preset = 1;
     p->current_level = 1;                       /* LV_PALETTE — landing mirrors Console knobs */
     seed_urandom(&p->rng, &p->ent);             /* true random from the first tap */
     p->pending_rnd=0; p->pending_preset=-1; p->rnd_gain=1.0f; p->rnd_phase=0; p->rnd_hold=0;
+    fold_adaa_init();                                  /* FOLD's ADAA integral table */
     p->space_pool = pfx_clouds_alloc(PFX_SPACE, SR);   /* pre-allocate heavy engines */
     p->bloom_pool = pfx_clouds_alloc(PFX_BLOOM, SR);   /* (NULL-safe: slots passthrough) */
     load_preset(p, 1);                          /* start on Init (Drive→Doubler→Cascade→Filter) */
@@ -1323,6 +1516,7 @@ static void apply_pending(palette_t *p){
     if(had_preset){ load_preset(p, p->pending_preset); p->pending_preset=-1; }
     int r=p->pending_rnd; p->pending_rnd=0;
     if(r==1) rnd_patch(p); else if(r==2) rnd_effect(p);
+    slots_engage_now(p);                                 /* we're at the duck's silence */
     if(had_preset || r==1 || r==2) clear_feedback(p);   /* patch-level -> reset feedback loop */
 }
 
@@ -1620,16 +1814,52 @@ static int get_param(void *instance, const char *key, char *buf, int buf_len){
 /* ═══════════════════════════════════════════════════════════════════════════
  *  AUDIO  — slots processed in FX-Reorder order; equal-power global Mix.
  * ═══════════════════════════════════════════════════════════════════════════ */
+/* Character-group level match (ported from Loopex 9bc1243). Drive, Sweeten, Fuzz,
+ * Howl and Fold are LEVEL-NORMALISING distortions: quiet material gets enormous gain
+ * (+19..+22 dB on a -24 dBFS source) while loud material barely moves, and each hits
+ * its levelling point at a different Amount. A static makeup can't fix that because
+ * the error tracks input level, so track dry and wet power (~150 ms) and pull the wet
+ * PARTWAY back toward the dry level: tame the extremes and line the five up without
+ * flattening them to unity. The pull is done in dB (gain = (dry/wet)^(LVL_MATCH/2)),
+ * so "75 % of the way" holds for big errors too - Loopex interpolates the linear gain,
+ * which only corrects ~11 of a 26 dB error. SWELL is deliberately excluded (Loopex
+ * includes it): its envelope is as slow as the matcher, which would undo the swell. */
+#define LVL_MATCH 0.75f
+static int is_character_fx(int fx){
+    return fx==PFX_DRIVE||fx==PFX_SWEETEN||fx==PFX_FUZZ||fx==PFX_HOWL||fx==PFX_FOLD;
+}
+/* Gain-heavy effects turn a line-in noise floor into loud hiss (Fuzz +62 dB on a
+ * -80 dBFS floor). A soft gate keyed on the DRY peak (instant attack, ~150 ms
+ * release) closes the wet below ~-72 dBFS and is fully open above ~-60 dBFS. */
+static int is_gated_fx(int fx){ return is_character_fx(fx) || fx==PFX_SQUASH; }
+
+/* NaN / Inf / runaway test by bit pattern - immune to -ffast-math, which deletes
+ * `x != x` and isfinite(). Exponent 0xFF = Inf/NaN; >= 2^5 = |x| >= 32 (runaway). */
+static inline int bad_sample(float x){
+    union { float f; uint32_t u; } v; v.f=x;
+    uint32_t e=(v.u>>23)&0xFFu;
+    return e==0xFFu || e>=127u+5u;
+}
+/* Output safety: transparent below 0.89 (-1 dBFS), soft knee into a 1.0 ceiling so
+ * hot patches saturate gently instead of hard-clipping the int16 rail. */
+static inline float soft_limit(float x){
+    float a=fabsf(x); if(a<=0.89f) return x;
+    float y=0.89f+0.11f*sb_tanh((a-0.89f)/0.11f);
+    return x<0.0f? -y : y;
+}
+static inline float smooth01(float g){ g=clampf(g,0.0f,1.0f); return g*g*(3.0f-2.0f*g); }
+
+#define SUBBLK 16          /* params are smoothed per 16 samples, not per 128 */
+
 static void process_block(void *instance, int16_t *buf, int frames){
     palette_t *p=(palette_t*)instance; if(!p||frames<=0) return;
     if(frames>MAXFRAMES) frames=MAXFRAMES;
 
-    const uint8_t *order = PERM[clampi(p->fx_reorder,0,23)];
     float gsm = 1.0f - expf(-(float)frames/(0.015f*SR));     /* 15 ms smooth for globals */
+    float iv0 = p->iv_sm, mix0 = p->mix_sm;
     p->iv_sm  += gsm*(p->input_vol - p->iv_sm);
     p->mix_sm += gsm*(p->mix       - p->mix_sm);
     p->fb_sm  += gsm*(p->feedback  - p->fb_sm);
-    float iv = p->iv_sm;
 
     /* ── tempo sync: effective BPM → synced delay time + LFO rate for this block ── */
     float bpm = (p->tempo_src==1) ? (float)p->tempo_bpm
@@ -1664,10 +1894,13 @@ static void process_block(void *instance, int16_t *buf, int frames){
     /* feedback gain curve: fb_sm^2 keeps the low range gentle; ×(0.85..1.15)
      * pushes just past unity at the top so it self-oscillates (soft-clipped). */
     float fgain = p->fb_sm*p->fb_sm*(0.85f + 0.30f*p->fb_sm);
-    /* de-interleave + input volume + global feedback send (damped + soft-clipped) */
-    float dryL[MAXFRAMES], dryR[MAXFRAMES];
+    /* de-interleave + input volume (per-sample ramp: no block-rate zipper) + global
+     * feedback send (damped + soft-clipped) */
+    float dryL[MAXFRAMES], dryR[MAXFRAMES], chL[MAXFRAMES], chR[MAXFRAMES];
+    float ivstep=(p->iv_sm-iv0)/(float)frames;
     for(int i=0;i<frames;i++){
         float l=buf[2*i]/32768.0f, r=buf[2*i+1]/32768.0f;
+        float iv=iv0+ivstep*(float)(i+1);
         dryL[i]=l; dryR[i]=r;
         /* DC/sub high-pass first (stops rumble building to a rail or cancelling to
          * silence), then tone-damping LP, then a curved gain: gentle across the low
@@ -1679,59 +1912,163 @@ static void process_block(void *instance, int16_t *buf, int frames){
         float fbl=sb_tanh(p->fb_lp_l*fgain);                /* soft-limited regeneration */
         float fbr=sb_tanh(p->fb_lp_r*fgain);
         p->L[i]=l*iv+fbl; p->R[i]=r*iv+fbr;
+        chL[i]=p->L[i]; chR[i]=p->R[i];                    /* chain input (reorder dip) */
     }
+
+    /* FX Reorder: changing the path mid-signal is a step in the waveform - at the
+     * output, and inside every delay line whose input suddenly comes from a different
+     * slot (heard again one echo later). So over ~5 ms dip EVERY slot's input to zero
+     * and the chain output to its own input, swap the order at the bottom, rise back. */
+    if(p->order_cur!=p->fx_reorder && p->ro_gain<=0.0f) p->order_cur=clampi(p->fx_reorder,0,23);
+    const uint8_t *order = PERM[clampi(p->order_cur,0,23)];
+    float rog[MAXFRAMES]; int ro_active=0;
+    {
+        float rt = (p->order_cur==p->fx_reorder)? 1.0f : 0.0f;
+        const float ro_inc = 1.0f/(SR*0.005f);
+        if(rt<1.0f || p->ro_gain<1.0f){
+            float g=p->ro_gain; ro_active=1;
+            for(int i=0;i<frames;i++){ g += clampf(rt-g, -ro_inc, ro_inc); rog[i]=smooth01(g); }
+            p->ro_gain=g;
+        }
+    }
+
     /* run the 4 slots in reorder sequence (Off = passthrough, never dispatched).
      * Clouds effects dispatch through the opaque heavy interface; C effects use the
-     * vtable. Per-slot 20 ms analog-style smoothing of amount/macro/drift (no zipper
-     * on knob moves or preset/random loads). A just-switched slot fades input→output
-     * over ~25 ms with a smoothstep curve (click-free switching). */
-    const float psm = 1.0f - expf(-(float)frames/(0.015f*SR));   /* 15 ms param smooth */
-    const float ramp_inc = 1.0f / (SR * 0.025f);                 /* 25 ms switch fade */
+     * vtable. Amount/Macro/Drift are smoothed (15 ms) per 16-sample sub-block, so knob
+     * moves arrive as small steps. A Select change first fades the RUNNING effect out
+     * to dry (~6 ms), then swaps (slot_engage) and fades the new one in (~25 ms,
+     * smoothstep) - no step in the waveform either way. */
+    const float psm = 1.0f - expf(-(float)SUBBLK/(0.015f*SR));   /* 15 ms param smooth */
+    const float ramp_inc = 1.0f / (SR * 0.025f);                 /* 25 ms fade in */
+    const float out_inc  = 1.0f / (SR * 0.006f);                 /* 6 ms fade out */
+    const float grel = expf(-(float)frames/(0.15f*SR));          /* gate release ~150 ms */
     float preL[MAXFRAMES], preR[MAXFRAMES];
     for(int k=0;k<NUM_SLOTS;k++){
-        slot_t *sl=&p->slots[order[k]];
-        int fx=sl->select;
+        int si=order[k];
+        slot_t *sl=&p->slots[si];
+        if(sl->active!=sl->select && (sl->active==PFX_OFF || sl->xgain<=0.0f)
+           && !heavy_busy(p,si,sl->select))
+            slot_engage(p,si);                       /* faded out (or was Off): swap now */
+        int fx=sl->active;
         if(fx==PFX_OFF) continue;
-        sl->amt_sm += psm*(sl->amount - sl->amt_sm);
-        sl->mac_sm += psm*(sl->macro  - sl->mac_sm);
-        sl->drf_sm += psm*(sl->drift  - sl->drf_sm);
         sl->dsp.sync_time = sync_time;     /* tempo sync (0 = free-running) */
         sl->dsp.sync_rate = sync_rate;
-        int ramping = sl->ramp < 1.0f;
-        if(ramping){ memcpy(preL,p->L,frames*sizeof(float)); memcpy(preR,p->R,frames*sizeof(float)); }
-        if(is_clouds_fx(fx)){
-            if(sl->dsp.heavy)
-                pfx_clouds_process(fx, sl->dsp.heavy, p->L, p->R, frames,
-                                   sl->amt_sm, sl->mac_sm, sl->drf_sm);
-            /* heavy alloc failed → leave signal untouched (passthrough) */
-        } else {
-            FX_TABLE[fx].process(&sl->dsp, p->L, p->R, frames,
-                                 sl->amt_sm, sl->mac_sm, sl->drf_sm);
-        }
-        if(ramping){
+        float xt = (sl->active==sl->select)? 1.0f : 0.0f;          /* fade-out target */
+        int blending = sl->ramp < 1.0f || sl->xgain < 1.0f || xt < 1.0f;
+        memcpy(preL,p->L,frames*sizeof(float)); memcpy(preR,p->R,frames*sizeof(float));
+        /* a just-engaged slot also fades its INPUT in: its delay lines start empty, so
+         * signal recorded abruptly would come back as a hard edge one echo later */
+        if(sl->ramp<1.0f || ro_active){
             float rr=sl->ramp;
             for(int i=0;i<frames;i++){
-                float g=rr+ramp_inc*(float)i; if(g>1.0f)g=1.0f;
-                g=g*g*(3.0f-2.0f*g);                  /* smoothstep — gentler crossfade */
-                p->L[i]=preL[i]*(1.0f-g)+p->L[i]*g;
-                p->R[i]=preR[i]*(1.0f-g)+p->R[i]*g;
+                float gi=1.0f;
+                if(sl->ramp<1.0f){ rr+=ramp_inc; if(rr>1.0f) rr=1.0f; gi=smooth01(rr); }
+                if(ro_active) gi*=rog[i];
+                p->L[i]*=gi; p->R[i]*=gi;
             }
-            sl->ramp = rr + ramp_inc*(float)frames; if(sl->ramp>1.0f) sl->ramp=1.0f;
+        }
+        int match = is_character_fx(fx);
+        int gated = is_gated_fx(fx);
+        float dp = 0.0f, dpk = 0.0f;
+        if(match||gated) for(int i=0;i<frames;i++){
+            dp += p->L[i]*p->L[i] + p->R[i]*p->R[i];
+            float a=fabsf(p->L[i]); if(a>dpk)dpk=a; a=fabsf(p->R[i]); if(a>dpk)dpk=a; }
+        for(int o=0;o<frames;o+=SUBBLK){
+            int m=frames-o; if(m>SUBBLK) m=SUBBLK;
+            sl->amt_sm += psm*(sl->amount - sl->amt_sm);
+            sl->mac_sm += psm*(sl->macro  - sl->mac_sm);
+            sl->drf_sm += psm*(sl->drift  - sl->drf_sm);
+            if(is_clouds_fx(fx)){
+                if(sl->dsp.heavy)
+                    pfx_clouds_process(fx, sl->dsp.heavy, p->L+o, p->R+o, m,
+                                       sl->amt_sm, sl->mac_sm, sl->drf_sm);
+                /* heavy alloc failed → leave signal untouched (passthrough) */
+            } else {
+                FX_TABLE[fx].process(&sl->dsp, p->L+o, p->R+o, m,
+                                     sl->amt_sm, sl->mac_sm, sl->drf_sm);
+            }
+        }
+        /* health: a NaN/Inf/runaway would otherwise live in the slot's state forever
+         * (a dead slot until reload). Replace the block with dry and reset the slot. */
+        int bad=0;
+        for(int i=0;i<frames;i++) bad |= bad_sample(p->L[i]) | bad_sample(p->R[i]);
+        if(bad){
+            memcpy(p->L,preL,frames*sizeof(float)); memcpy(p->R,preR,frames*sizeof(float));
+            if(sl->dsp.heavy) pfx_clouds_reset(sl->dsp.heavy);
+            slot_reset(sl); sl->ramp=0.0f;
+            continue;
+        }
+        if(match){
+            slot_dsp_t *d=&sl->dsp;
+            float wp = 0.0f;
+            for(int i=0;i<frames;i++) wp += p->L[i]*p->L[i] + p->R[i]*p->R[i];
+            float inv = 1.0f/(float)(frames*2);
+            d->lvlDry += ((dp*inv) - d->lvlDry) * 0.02f;   /* ~150 ms at block rate */
+            d->lvlWet += ((wp*inv) - d->lvlWet) * 0.02f;
+            if(d->lvlDry < 1e-15f) d->lvlDry = 0.0f;        /* denormal floor in long silence */
+            if(d->lvlWet < 1e-15f) d->lvlWet = 0.0f;
+            float tg = 1.0f;
+            if(d->lvlWet > 1e-9f && d->lvlDry > 1e-9f){
+                tg = powf(d->lvlDry / d->lvlWet, 0.5f*LVL_MATCH);   /* dB-domain partial pull */
+                tg = clampf(tg, 0.05f, 4.0f);
+            }
+            if(d->lvlGain <= 0.0f) d->lvlGain = tg;        /* fresh slot: snap, don't glide */
+            /* applied in proportion to Amount (full from 0.1 up): switching it off at a
+             * threshold snapped the gain back to 1 - a click as Amount reached 0 */
+            float w1 = clampf(sl->amt_sm*10.0f, 0.0f, 1.0f), w0=d->lvlW, ws=(w1-w0)/(float)frames;
+            for(int i=0;i<frames;i++){                      /* ramp across the block */
+                d->lvlGain += (tg - d->lvlGain) * 0.002f;
+                float g = 1.0f + (d->lvlGain - 1.0f)*(w0+ws*(float)(i+1));
+                p->L[i] *= g; p->R[i] *= g;
+            }
+            d->lvlW = w1;
+        }
+        if(gated){
+            sl->genv = (dpk > sl->genv)? dpk : sl->genv*grel;
+            float db = 20.0f*log10f(sl->genv + 1e-9f);
+            float gt = smooth01((db + 72.0f)/12.0f);         /* -72 closed .. -60 open */
+            float g0 = sl->gate, gs=(gt-g0)/(float)frames;
+            for(int i=0;i<frames;i++){                      /* gate the WET: blend to dry */
+                float g=g0+gs*(float)(i+1);
+                p->L[i]=preL[i]+(p->L[i]-preL[i])*g;
+                p->R[i]=preR[i]+(p->R[i]-preR[i])*g;
+            }
+            sl->gate=gt;
+        }
+        if(blending){
+            float rr=sl->ramp, xg=sl->xgain;
+            for(int i=0;i<frames;i++){
+                rr += ramp_inc; if(rr>1.0f) rr=1.0f;
+                xg += clampf(xt-xg, -out_inc, out_inc);
+                float g=smooth01(rr)*smooth01(xg);        /* in-fade × out-fade */
+                p->L[i]=preL[i]+(p->L[i]-preL[i])*g;
+                p->R[i]=preR[i]+(p->R[i]-preR[i])*g;
+            }
+            sl->ramp=rr; sl->xgain=xg;
         }
     }
-    /* equal-power dry/wet + write back (NaN-guarded — many effects feed back).
+    /* reorder dip: crossfade the chain output toward the chain input */
+    if(ro_active)
+        for(int i=0;i<frames;i++){
+            p->L[i]=chL[i]+(p->L[i]-chL[i])*rog[i];
+            p->R[i]=chR[i]+(p->R[i]-chR[i])*rog[i];
+        }
+    /* equal-power dry/wet (Mix ramped per sample) + output soft limit + write back.
      * The wet chain output is stashed as next block's feedback source. */
-    float a=p->mix_sm*1.5707963f, dg=cosf(a), wg=sinf(a);
     float rtgt=(p->rnd_phase==1||p->rnd_phase==3)?0.0f:1.0f;   /* duck target */
     float rcoef=(p->rnd_phase==2)?0.0016f:0.006f;              /* fade-in slower than out */
     float rgn=p->rnd_gain;
+    float mstep=(p->mix_sm-mix0)/(float)frames;
+    int mramp = fabsf(mstep) > 1e-7f;                /* per-sample law only while Mix moves */
+    float dg=cosf(p->mix_sm*1.5707963f), wg=sinf(p->mix_sm*1.5707963f);
     for(int i=0;i<frames;i++){
         float wl=p->L[i], wr=p->R[i];
-        if(wl!=wl) wl=0.0f; if(wr!=wr) wr=0.0f;
+        if(bad_sample(wl)) wl=0.0f;
+        if(bad_sample(wr)) wr=0.0f;
         p->fbL[i]=wl; p->fbR[i]=wr;                 /* feedback source for next block */
-        float ol=dg*dryL[i]+wg*wl;
-        float orr=dg*dryR[i]+wg*wr;
-        if(ol!=ol) ol=0.0f; if(orr!=orr) orr=0.0f;
+        if(mramp){ float a=(mix0+mstep*(float)(i+1))*1.5707963f; dg=cosf(a); wg=sinf(a); }
+        float ol=soft_limit(dg*dryL[i]+wg*wl);
+        float orr=soft_limit(dg*dryR[i]+wg*wr);
         rgn += rcoef*(rtgt-rgn); ol*=rgn; orr*=rgn; /* duck envelope */
         int32_t il=(int32_t)(ol*32767.0f), ir=(int32_t)(orr*32767.0f);
         if(il>32767)il=32767; if(il<-32768)il=-32768;

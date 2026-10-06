@@ -11,8 +11,8 @@ table is authoritative — the per-effect "plan" further down is historical.
 
 | Effect | Implementation | Source |
 |--------|----------------|--------|
-| DRIVE | ported | super-boom-move `sb_apply_dist` Tube (sibling, MIT) |
-| FUZZ | ported | super-boom-move `sb_apply_dist` Fuzz (sibling, MIT) |
+| DRIVE | original C | split-band (clean bass) + asymmetric tanh with first-order ADAA (antiderivative anti-aliasing, Parker et al. 2016 — technique). Replaced the Airwindows Spiral shaper, which wavefolded and aliased heavily at high Amount. |
+| FUZZ | original C | two-stage tanh cascade (Big-Muff topology), both stages ADAA; bias operating point subtracted so silence stays silent |
 | CASCADE | ported | krautdrums-move `delay_saturate` in feedback (sibling, MIT) |
 | REELS | ported | krautdrums-move `delay_saturate` (sibling, MIT) |
 | CASSETTE | ported | mello-move `tape_cubic`/`tape_asym` (sibling, MIT) |
@@ -22,7 +22,7 @@ table is authoritative — the per-effect "plan" further down is historical.
 | FILTER | ported | Airwindows **Capacitor** pole recurrence (MIT) |
 | SQUASH | ported | Airwindows **Pressure4** vari-mu comp (MIT) |
 | INTERFERENCE | ported | Airwindows **DeRez2** rate/µ-law/bit crush (MIT) + orig ring-mod |
-| FOLD | ported | real Warps `lut_bipolar_fold` curve (MIT) — `warps_data.c` |
+| FOLD | ported | real Warps `lut_bipolar_fold` curve (MIT) — `warps_data.c`; ADAA through the LUT's running integral (`fold_cum`) |
 | SHIFT | ported | real Warps `QuadratureTransform` 17-pole Hilbert (MIT) — `warps_data.c` |
 | TREMOLO | ported | Airwindows **Tremolo** skew/density + chase smoothing (MIT) |
 | SWELL | ported | Airwindows **Swell** hysteresis gate + Zeno poles (MIT) |

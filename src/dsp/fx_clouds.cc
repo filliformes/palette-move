@@ -45,6 +45,7 @@ struct HeavyHdr { int kind; };
 /* ── SPACE ─────────────────────────────────────────────────────────────────── */
 struct SpaceState {
     int      kind;
+    float    t_sm, d_sm, lp_sm;                             /* glided reverb params */
     Reverb   verb;
     uint16_t buf[16384];
 };
@@ -52,6 +53,7 @@ static SpaceState *space_new(){
     SpaceState *st = new(std::nothrow) SpaceState;
     if(!st) return NULL;
     st->kind = FX_SPACE;
+    st->t_sm = -1.0f;
     memset(st->buf, 0, sizeof(st->buf));
     st->verb.Init(st->buf);
     st->verb.set_input_gain(0.2f);
@@ -62,9 +64,17 @@ static SpaceState *space_new(){
 static void space_process(SpaceState *st, float *l, float *r, int n,
                           float amount, float macro, float drift){
     st->verb.set_amount(1.0f);                              /* fully wet internally; mix outside */
-    st->verb.set_time(0.25f + macro*0.70f);                 /* small at macro=0 → bigger */
-    st->verb.set_diffusion(cclampf(0.5f + macro*0.3f + drift*0.1f,0.0f,0.9f));
-    st->verb.set_lp(cclampf(0.7f - drift*0.25f,0.2f,0.95f));/* slow tone wander */
+    /* glide the tank coefficients (~5 ms): a jump in time/diffusion/lp is a step in the
+     * all-pass and damping coefficients, which kicks the tank */
+    float tt=0.25f + macro*0.70f;                           /* small at macro=0 → bigger */
+    float td=cclampf(0.5f + macro*0.3f + drift*0.1f,0.0f,0.9f);
+    float tl=cclampf(0.7f - drift*0.25f,0.2f,0.95f);        /* slow tone wander */
+    if(st->t_sm<0.0f){ st->t_sm=tt; st->d_sm=td; st->lp_sm=tl; }
+    float k=1.0f-expf(-(float)n/(0.005f*CLD_SR));
+    st->t_sm+=k*(tt-st->t_sm); st->d_sm+=k*(td-st->d_sm); st->lp_sm+=k*(tl-st->lp_sm);
+    st->verb.set_time(st->t_sm);
+    st->verb.set_diffusion(st->d_sm);
+    st->verb.set_lp(st->lp_sm);
     FloatFrame fr[CLD_MAXBLK];
     if(n>CLD_MAXBLK) n=CLD_MAXBLK;
     float dryL[CLD_MAXBLK], dryR[CLD_MAXBLK];
@@ -84,6 +94,7 @@ static void space_process(SpaceState *st, float *l, float *r, int n,
 #define BLOOM_SH 8192                                       /* ~0.18 s shimmer buf */
 struct BloomState {
     int      kind;
+    float    t_sm, lp_sm;                                   /* glided reverb params */
     Reverb   verb;
     uint16_t buf[16384];
     float    shl[BLOOM_SH], shr[BLOOM_SH];                  /* shimmer (octave-up) ring */
@@ -95,6 +106,7 @@ static BloomState *bloom_new(){
     BloomState *st = new(std::nothrow) BloomState;
     if(!st) return NULL;
     st->kind = FX_BLOOM;
+    st->t_sm = -1.0f;
     memset(st->buf,0,sizeof(st->buf));
     memset(st->shl,0,sizeof(st->shl)); memset(st->shr,0,sizeof(st->shr));
     st->shwp=0; st->grpos=0.0f; st->seed=0x1234abcdu;
@@ -113,9 +125,14 @@ static void bloom_process(BloomState *st, float *l, float *r, int n,
                           float amount, float macro, float drift){
     /* reverb first (lush, long) */
     st->verb.set_amount(1.0f);
-    st->verb.set_time(0.30f + macro*0.65f);                 /* shorter at macro=0 → long bloom at max */
+    float tt=0.30f + macro*0.65f;                           /* shorter at macro=0 → long bloom at max */
+    float tl=cclampf(0.55f - drift*0.2f,0.2f,0.9f);
+    if(st->t_sm<0.0f){ st->t_sm=tt; st->lp_sm=tl; }
+    float k=1.0f-expf(-(float)n/(0.005f*CLD_SR));          /* glide (~5 ms), see SPACE */
+    st->t_sm+=k*(tt-st->t_sm); st->lp_sm+=k*(tl-st->lp_sm);
+    st->verb.set_time(st->t_sm);
     st->verb.set_diffusion(0.7f);
-    st->verb.set_lp(cclampf(0.55f - drift*0.2f,0.2f,0.9f));
+    st->verb.set_lp(st->lp_sm);
     FloatFrame fr[CLD_MAXBLK];
     if(n>CLD_MAXBLK) n=CLD_MAXBLK;
     for(int i=0;i<n;i++){ fr[i].l=l[i]; fr[i].r=r[i]; }
@@ -134,7 +151,9 @@ static void bloom_process(BloomState *st, float *l, float *r, int n,
         wl=tanhf(wl); wr=tanhf(wr);
         st->shl[st->shwp]=wl; st->shr[st->shwp]=wr;
         st->shwp=(st->shwp+1)%BLOOM_SH;
-        float wetL=fr[i].l + oL*amount, wetR=fr[i].r + oR*amount;
+        /* shimmer sits under the tail (x0.6): at full Amount + long Time the sum ran
+         * past full scale and hard-clipped */
+        float wetL=fr[i].l + oL*amount*0.6f, wetR=fr[i].r + oR*amount*0.6f;
         float mxl=wetL*0.7f+wetR*0.3f, mxr=wetR*0.7f+wetL*0.3f;  /* stereo-safe */
         l[i]=clerp(l[i],mxl,amount);         /* amount=0 → dry */
         r[i]=clerp(r[i],mxr,amount);
@@ -159,11 +178,13 @@ extern "C" void pfx_clouds_reset(void *heavy){
     HeavyHdr *h=(HeavyHdr*)heavy;
     if(h->kind==FX_SPACE){
         SpaceState *st=(SpaceState*)heavy;
+        st->t_sm=-1.0f;
         memset(st->buf,0,sizeof(st->buf));
         st->verb.Init(st->buf);
         st->verb.set_input_gain(0.2f); st->verb.set_diffusion(0.625f); st->verb.set_lp(0.7f);
     } else if(h->kind==FX_BLOOM){
         BloomState *st=(BloomState*)heavy;
+        st->t_sm=-1.0f;
         memset(st->buf,0,sizeof(st->buf));
         memset(st->shl,0,sizeof(st->shl)); memset(st->shr,0,sizeof(st->shr));
         st->shwp=0; st->grpos=0.0f;

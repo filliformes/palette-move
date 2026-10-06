@@ -104,7 +104,7 @@ Grouped only for organisation — any effect fits any slot. Columns are **Amount
 ### Character (saturation / dynamics)
 | Effect | Amount | Macro | Drift | Engine |
 |---|---|---|---|---|
-| **Drive** | drive (keeps low end) | tone tilt | bias wander | split-band + Airwindows Spiral shaper |
+| **Drive** | drive (keeps low end) | tone tilt | bias wander | split-band + asymmetric anti-aliased tanh |
 | **Sweeten** | comp + saturation | tone (dark↔air) | level drift | Airwindows Density/Mojo density fold |
 | **Fuzz** | sustain / gain | tone / bias | bias instability | two-stage Big-Muff cascade |
 | **Howl** | drive + resonance | resonant freq | freq wander | fuzz → near-self-oscillating SVF (sings) |

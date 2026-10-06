@@ -2,7 +2,7 @@
   "id": "palette",
   "name": "PALETTE",
   "abbrev": "PLT",
-  "version": "0.1.0",
+  "version": "0.1.5",
   "description": "4-slot serial multi-effect with a 24-effect palette. Chroma Console reimagined.",
   "author": "Filliformes",
   "dsp": "palette.so",

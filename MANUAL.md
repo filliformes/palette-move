@@ -5,7 +5,7 @@ Inspired by the Hologram Electronics [*Chroma Console*](https://www.hologramelec
 reorderable-module soul + DRIFT instability philosophy — but with more live flexibility, a
 genuinely stereo signal path, and four new originals the Chroma doesn't have.
 
-> **Status: v0.1.0, in testing.** Shared for feedback before public release. The **GLOBAL**
+> **Status: v0.1.5, in testing.** Shared for feedback before public release. The **GLOBAL**
 > page (feedback + tempo sync) is the newest addition and still being validated on hardware.
 > Tell me what to add or change — that's exactly what this build is for.
 
